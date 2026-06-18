@@ -1,6 +1,8 @@
 import os
 import threading
 import time
+import base64
+import re
 from functools import wraps
 
 import dotenv
@@ -52,6 +54,7 @@ class WhisperProcessor:
         self.cc = OpenCC('t2s') if self.convert_to_simplified else None
         self.add_symbol = os.getenv("ADD_SYMBOL", "false").lower() == "true"
         self.optimize_result = os.getenv("OPTIMIZE_RESULT", "false").lower() == "true"
+        self.clean_fillers = os.getenv("CLEAN_ASR_FILLERS", "true").lower() == "true"
         self.symbol = SymbolProcessor() if self.add_symbol or self.optimize_result else None
         self.service_platform = os.getenv("SERVICE_PLATFORM", "groq").lower()
         self.timeout_seconds = self.OPENAI_TIMEOUT if self.service_platform == "openai" else self.DEFAULT_TIMEOUT
@@ -63,6 +66,18 @@ class WhisperProcessor:
             # 使用官方 OpenAI API
             self.client = OpenAI(api_key=api_key, base_url="https://api.openai.com/v1")
             self.DEFAULT_MODEL = "gpt-4o-transcribe"
+        elif self.service_platform in ("aliyun", "dashscope", "bailian"):
+            api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("BAILIAN_API_KEY")
+            assert api_key, "未设置 DASHSCOPE_API_KEY 或 BAILIAN_API_KEY 环境变量"
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url=os.getenv(
+                    "DASHSCOPE_BASE_URL",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            )
+            self.DEFAULT_MODEL = os.getenv("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash")
+            self.timeout_seconds = self.OPENAI_TIMEOUT
         elif self.service_platform == "groq":
             api_key = os.getenv("GROQ_API_KEY")
             base_url = os.getenv("GROQ_BASE_URL")
@@ -84,6 +99,40 @@ class WhisperProcessor:
         if not self.convert_to_simplified or not text:
             return text
         return self.cc.convert(text)
+
+    def _clean_asr_fillers(self, text: str) -> str:
+        """做保守的口语清理，不调用额外模型。"""
+        if not self.clean_fillers or not text:
+            return text
+
+        cleaned = text.strip()
+
+        # 删除常见停顿词和口头禅。限定在标点/空白边界附近，避免误删词语内部字符。
+        filler_patterns = [
+            r"(?:(?<=^)|(?<=[\s，,。.!！？?；;：:、]))(?:嗯+|呃+|额+|啊+|呐+|唔+|em+|emm+|呃嗯+)[\s，,。.!！？?；;：:、]*",
+            r"[\s，,。.!！？?；;：:、]*(?:嗯+|呃+|额+|啊+|呐+|唔+|em+|emm+|呃嗯+)(?=$|[\s，,。.!！？?；;：:、])",
+            r"(?:(?<=^)|(?<=[\s，,。.!！？?；;：:、]))(?:这个|那个|就是|然后呢|然后|怎么说呢|怎么讲呢|你知道吧|对吧|是吧)[\s，,。.!！？?；;：:、]*",
+        ]
+        for pattern in filler_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+        # 压缩短重复：我我、他他、这个这个、然后然后。
+        repeat_words = [
+            "我", "你", "他", "她", "它", "这", "那", "是", "有", "要", "会", "就",
+            "这个", "那个", "然后", "但是", "如果", "因为", "所以",
+        ]
+        for word in repeat_words:
+            cleaned = re.sub(f"(?:{re.escape(word)}){{2,}}", word, cleaned)
+
+        # 清理标点和空白，让删除停顿词后的句子更自然。
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"[，,、]{2,}", "，", cleaned)
+        cleaned = re.sub(r"[。.!！？?；;：:]{2,}", lambda m: m.group(0)[0], cleaned)
+        cleaned = re.sub(r"^[\s，,。.!！？?；;：:、]+", "", cleaned)
+        cleaned = re.sub(r"[\s，,、]+([。.!！？?；;：:])", r"\1", cleaned)
+        cleaned = re.sub(r"([，,。.!！？?；;：:、])\s+", r"\1", cleaned)
+
+        return cleaned.strip()
     
     @timeout_decorator(180)  # OpenAI 专用超时时间
     def _call_openai_api(self, mode, audio_data, prompt):
@@ -103,12 +152,44 @@ class WhisperProcessor:
                 file=("audio.wav", audio_data)
             )
         return str(response).strip()
+
+    @timeout_decorator(180)
+    def _call_dashscope_asr_api(self, audio_data):
+        """调用阿里云百炼 Qwen-ASR 录音文件识别接口。"""
+        audio_data.seek(0)
+        audio_b64 = base64.b64encode(audio_data.read()).decode("ascii")
+        response = self.client.chat.completions.create(
+            model=self.DEFAULT_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": f"data:audio/wav;base64,{audio_b64}",
+                            },
+                        },
+                    ],
+                },
+            ],
+            extra_body={
+                "asr_options": {
+                    "enable_itn": os.getenv("DASHSCOPE_ASR_ENABLE_ITN", "true").lower() == "true",
+                },
+            },
+        )
+        return (response.choices[0].message.content or "").strip()
     
     def _call_whisper_api(self, mode, audio_data, prompt):
         """调用 Whisper API"""
         if self.service_platform == "openai":
             # 使用专用的 OpenAI API 调用（已有180秒超时）
             return self._call_openai_api(mode, audio_data, prompt)
+        elif self.service_platform in ("aliyun", "dashscope", "bailian"):
+            if mode == "translations":
+                raise ValueError("DashScope/Qwen-ASR 不支持翻译模式")
+            return self._call_dashscope_asr_api(audio_data)
         else:
             # GROQ API 使用10秒超时
             return self._call_groq_api(mode, audio_data, prompt)
@@ -153,6 +234,7 @@ class WhisperProcessor:
 
             logger.info(f"API 调用成功 ({mode}), 耗时: {time.time() - start_time:.1f}秒")
             result = self._convert_traditional_to_simplified(result)
+            result = self._clean_asr_fillers(result)
             logger.info(f"识别结果: {result}")
             
             # OpenAI GPT-4o transcribe 自带标点符号，无需额外处理

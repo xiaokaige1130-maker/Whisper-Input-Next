@@ -65,7 +65,7 @@ class VoiceAssistant:
         self.floating_preview = FloatingPreviewWindow()
         self.max_auto_retries = int(os.getenv("AUTO_RETRY_LIMIT", "5"))
 
-        # 转录服务配置: "doubao" (默认，流式) 或 "openai" (批量)
+        # 转录服务配置: "doubao" (流式), "openai" 或 "aliyun"/"dashscope" (批量)
         self.transcription_service = os.getenv("TRANSCRIPTION_SERVICE", "doubao")
 
         # 流式转录相关
@@ -82,11 +82,12 @@ class VoiceAssistant:
         elif self.openai_processor is not None:
             default_transcription_start = self.start_openai_recording
             default_transcription_stop = self.stop_openai_recording
-            logger.info("默认转录快捷键使用 OpenAI 批量转录")
+            service = getattr(self.openai_processor, "service_platform", "batch")
+            logger.info(f"默认转录快捷键使用 {service} 批量转录")
         else:
             default_transcription_start = self._show_transcription_unavailable
             default_transcription_stop = self._show_transcription_unavailable
-            logger.warning("默认转录快捷键不可用：豆包和 OpenAI 均未配置")
+            logger.warning("默认转录快捷键不可用：豆包和批量转录服务均未配置")
 
         self.keyboard_manager = KeyboardManager(
             on_record_start=default_transcription_start,
@@ -356,16 +357,16 @@ class VoiceAssistant:
         return job.processor, "unknown"
 
     def start_openai_recording(self):
-        """开始录音（OpenAI GPT-4o transcribe 模式）"""
+        """开始录音（批量转录模式）"""
         if self.openai_processor is None:
-            logger.warning("OpenAI 转录不可用，请配置 OFFICIAL_OPENAI_API_KEY 或使用豆包")
-            self.status_controller.show_error("OpenAI 转录不可用")
+            logger.warning("批量转录不可用，请配置 OpenAI、DashScope 或使用豆包")
+            self.status_controller.show_error("批量转录不可用")
             self.keyboard_manager.reset_state()
             return
         self.audio_recorder.start_recording()
 
     def stop_openai_recording(self):
-        """停止录音并处理（OpenAI GPT-4o transcribe 模式）"""
+        """停止录音并处理（批量转录模式）"""
         audio = self.audio_recorder.stop_recording()
         if audio == "TOO_SHORT":
             logger.warning("录音时长太短，状态将重置")
@@ -567,15 +568,23 @@ class VoiceAssistant:
 
 def main():
     try:
-        # 创建三处理器架构：OpenAI + 本地 Whisper + 豆包流式
+        # 创建三处理器架构：批量云转录 + 本地 Whisper + 豆包流式
         original_platform = os.environ.get("SERVICE_PLATFORM")
+        preferred_batch_platform = os.getenv("BATCH_TRANSCRIPTION_SERVICE", "").strip().lower()
+        if not preferred_batch_platform:
+            transcription_service = os.getenv("TRANSCRIPTION_SERVICE", "").strip().lower()
+            preferred_batch_platform = (
+                transcription_service
+                if transcription_service in {"openai", "aliyun", "dashscope", "bailian", "groq", "siliconflow"}
+                else "openai"
+            )
 
-        # 创建 OpenAI 处理器
-        os.environ["SERVICE_PLATFORM"] = "openai"
+        # 创建批量云转录处理器
+        os.environ["SERVICE_PLATFORM"] = preferred_batch_platform
         try:
             openai_processor = WhisperProcessor()
         except (AssertionError, ValueError) as e:
-            logger.warning(f"OpenAI 转录不可用，将禁用批量/翻译模式: {e}")
+            logger.warning(f"{preferred_batch_platform} 批量转录不可用，将禁用批量/翻译模式: {e}")
             openai_processor = None
 
         # 创建本地 Whisper 处理器（可选，如果不可用则跳过）
@@ -589,7 +598,7 @@ def main():
         # 创建豆包流式处理器（可选，如果 API Key 未配置则跳过）
         doubao_processor = DoubaoStreamingProcessor()
         if not doubao_processor.is_available():
-            logger.warning("豆包流式 ASR 不可用（未配置 API Key），将使用 OpenAI 作为默认转录服务")
+            logger.warning("豆包流式 ASR 不可用（未配置 API Key），将使用批量转录服务作为默认转录服务")
             doubao_processor = None
 
         # 恢复原始环境变量

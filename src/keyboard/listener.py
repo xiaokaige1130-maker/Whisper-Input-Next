@@ -15,6 +15,15 @@ class KeyboardManager:
         "win": Key.cmd,
         "windows": Key.cmd,
         "super": Key.cmd,
+        "alt": Key.alt,
+        "option": Key.alt,
+        "alt_l": Key.alt,
+        "option_l": Key.alt,
+        "left_option": Key.alt,
+        "alt_r": Key.alt_r,
+        "option_r": Key.alt_r,
+        "right_option": Key.alt_r,
+        "alt_gr": Key.alt_gr,
     }
     KEY_DISPLAY_NAMES = {
         "ctrl": "Ctrl",
@@ -24,6 +33,15 @@ class KeyboardManager:
         "win": "Win",
         "windows": "Win",
         "super": "Win",
+        "alt": "Alt",
+        "option": "Option",
+        "alt_l": "Left Option",
+        "option_l": "Left Option",
+        "left_option": "Left Option",
+        "alt_r": "Right Option",
+        "option_r": "Right Option",
+        "right_option": "Right Option",
+        "alt_gr": "AltGr",
     }
 
     def __init__(self, on_record_start, on_record_stop, on_translate_start, on_translate_stop, on_kimi_start, on_kimi_stop, on_reset_state, on_state_change=None):
@@ -31,6 +49,7 @@ class KeyboardManager:
         self.ctrl_pressed = False  # 快捷键修饰键状态
         self.f_pressed = False  # F键状态
         self.i_pressed = False  # I键状态
+        self.single_hotkey_pressed = False
         self.temp_text_length = 0  # 用于跟踪临时文本的长度
         self.processing_text = None  # 用于跟踪正在处理的文本
         self.error_message = None  # 用于跟踪错误信息
@@ -86,8 +105,26 @@ class KeyboardManager:
             "TRANSLATIONS_BUTTON",
             "win",
         )
+        transcription_hotkey = os.getenv("TRANSCRIPTION_HOTKEY", "").strip().lower()
+        self.single_transcription_hotkey = None
+        self.single_transcription_hotkey_display = ""
+        self.single_transcription_hotkey_mode = os.getenv("TRANSCRIPTION_HOTKEY_MODE", "toggle").strip().lower()
+        if transcription_hotkey:
+            self.single_transcription_hotkey, self.single_transcription_hotkey_display = self._resolve_button(
+                "TRANSCRIPTION_HOTKEY",
+                transcription_hotkey,
+            )
+            if self.single_transcription_hotkey_mode not in {"toggle", "hold"}:
+                logger.error(f"无效的 TRANSCRIPTION_HOTKEY_MODE={self.single_transcription_hotkey_mode}，回退到 toggle")
+                self.single_transcription_hotkey_mode = "toggle"
 
-        logger.info(f"按 {modifier_display}+{transcriptions_display} 键：切换录音状态（转录模式）")
+        if self.single_transcription_hotkey is not None:
+            if self.single_transcription_hotkey_mode == "hold":
+                logger.info(f"按住 {self.single_transcription_hotkey_display} 键：开始录音，松开停止并转写")
+            else:
+                logger.info(f"按 {self.single_transcription_hotkey_display} 键：切换录音状态（转录模式）")
+        else:
+            logger.info(f"按 {modifier_display}+{transcriptions_display} 键：切换录音状态（转录模式）")
         logger.info(f"按 {modifier_display}+I 键：切换录音状态（本地 Whisper 模式）")
         logger.info(f"两种模式都是按一下开始，再按一下结束")
 
@@ -412,9 +449,46 @@ class KeyboardManager:
             self.state = InputState.PROCESSING_KIMI
             logger.info("⏹️ 停止录音（本地 Whisper 模式）")
 
+    def start_hold_recording(self):
+        """按住式热键：按下开始录音。"""
+        if self.single_hotkey_pressed:
+            return
+
+        self.single_hotkey_pressed = True
+        current_time = time.time()
+        if current_time - self.last_key_time < self.KEY_DEBOUNCE_TIME:
+            return
+
+        self.last_key_time = current_time
+        if not self.is_recording and self.state.can_start_recording:
+            self.is_recording = True
+            self.state = InputState.RECORDING
+            logger.info("🎤 开始录音（按住说话模式）")
+
+    def stop_hold_recording(self):
+        """按住式热键：松开停止录音并转写。"""
+        if not self.single_hotkey_pressed:
+            return
+
+        self.single_hotkey_pressed = False
+        if self.is_recording:
+            self.is_recording = False
+            self.state = InputState.PROCESSING
+            logger.info("⏹️ 停止录音（按住说话模式）")
+
     def on_press(self, key):
         """按键按下时的回调"""
         try:
+            if (
+                self.single_transcription_hotkey is not None
+                and self._key_matches(key, self.single_transcription_hotkey)
+            ):
+                if self.single_transcription_hotkey_mode == "hold":
+                    self.start_hold_recording()
+                else:
+                    self.toggle_recording()
+                return
+
             # 检查转录按钮（字符键或特殊键）
             is_transcription_key = self._key_matches(key, self.transcriptions_button)
                 
@@ -446,6 +520,14 @@ class KeyboardManager:
     def on_release(self, key):
         """按键释放时的回调"""
         try:
+            if (
+                self.single_transcription_hotkey is not None
+                and self._key_matches(key, self.single_transcription_hotkey)
+            ):
+                if self.single_transcription_hotkey_mode == "hold":
+                    self.stop_hold_recording()
+                return
+
             # 检查转录按钮（字符键或特殊键）
             is_transcription_key = self._key_matches(key, self.transcriptions_button)
                 
@@ -477,6 +559,7 @@ class KeyboardManager:
         self.ctrl_pressed = False
         self.f_pressed = False
         self.i_pressed = False
+        self.single_hotkey_pressed = False
         self.is_recording = False
         self.last_key_time = time.time()
         self.processing_text = None

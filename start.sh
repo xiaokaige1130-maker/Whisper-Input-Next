@@ -39,7 +39,7 @@ if [ ! -d ".venv" ]; then
 fi
 
 # 检查依赖是否已安装
-if [ ! -f ".venv/pyvenv.cfg" ] || [ ! -f "venv/lib/python*/site-packages/openai" ]; then
+if [ ! -f ".venv/pyvenv.cfg" ] || ! .venv/bin/python -c "import openai" >/dev/null 2>&1; then
   echo "📦 安装项目依赖..."
   source .venv/bin/activate
   pip install -r requirements.txt

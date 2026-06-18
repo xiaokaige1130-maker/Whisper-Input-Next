@@ -67,6 +67,7 @@ class DoubaoStreamingProcessor:
     """豆包流式语音识别处理器"""
 
     def __init__(self):
+        self.api_key = os.getenv("DOUBAO_API_KEY", "")
         self.app_key = os.getenv("DOUBAO_APP_KEY", "")
         self.access_key = os.getenv("DOUBAO_ACCESS_KEY", "")
         # 使用优化版双向流式接口
@@ -78,12 +79,12 @@ class DoubaoStreamingProcessor:
         self._is_connected = False
         self._sample_rate = DEFAULT_SAMPLE_RATE  # 默认采样率，会在连接时更新
 
-        if not self.app_key or not self.access_key:
-            logger.warning("豆包 API Key 未配置，请设置 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY")
+        if not self.api_key and (not self.app_key or not self.access_key):
+            logger.warning("豆包 API Key 未配置，请设置 DOUBAO_API_KEY，或设置 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY")
 
     def is_available(self) -> bool:
         """检查是否可用（API Key 是否配置）"""
-        return bool(self.app_key and self.access_key)
+        return bool(self.api_key or (self.app_key and self.access_key))
 
     def _gzip_compress(self, data: bytes) -> bytes:
         return gzip.compress(data)
@@ -280,9 +281,12 @@ class DoubaoStreamingProcessor:
             headers = {
                 "X-Api-Resource-Id": "volc.bigasr.sauc.duration",  # 2.0版本小时版
                 "X-Api-Connect-Id": str(uuid.uuid4()),
-                "X-Api-Access-Key": self.access_key,
-                "X-Api-App-Key": self.app_key
             }
+            if self.api_key:
+                headers["X-Api-Key"] = self.api_key
+            else:
+                headers["X-Api-Access-Key"] = self.access_key
+                headers["X-Api-App-Key"] = self.app_key
 
             self._ws = await self._session.ws_connect(
                 self.ws_url,
