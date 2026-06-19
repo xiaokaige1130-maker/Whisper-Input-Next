@@ -11,7 +11,12 @@ class AudioArchiveManager:
     def __init__(self, archive_dir: str = "audio_archive"):
         self.archive_dir = archive_dir
         self.audio_dir = os.path.join(self.archive_dir, "audio")
-        self.ensure_directory()
+        self.mode = os.getenv("AUDIO_ARCHIVE_MODE", "off").strip().lower()
+        if self.mode not in {"off", "all"}:
+            logger.warning(f"无效的 AUDIO_ARCHIVE_MODE={self.mode}，回退到 off")
+            self.mode = "off"
+        if self.mode != "off":
+            self.ensure_directory()
 
     def ensure_directory(self) -> None:
         if not os.path.exists(self.archive_dir):
@@ -64,6 +69,9 @@ class AudioArchiveManager:
 
     def save_audio_bytes(self, audio_bytes: bytes, prefix: str = "recording") -> Optional[str]:
         if not audio_bytes:
+            return None
+        if self.mode == "off":
+            logger.debug("音频归档已关闭，跳过保存录音文件")
             return None
 
         self.ensure_directory()
