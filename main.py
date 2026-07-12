@@ -4,6 +4,8 @@ import queue
 import sys
 import threading
 import asyncio
+import time
+import wave
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,6 +23,10 @@ from src.transcription.local_whisper import LocalWhisperProcessor
 from src.transcription.doubao_streaming import DoubaoStreamingProcessor
 from src.ui.status_bar import StatusBarController
 from src.ui.floating_preview import FloatingPreviewWindow
+from src.glossary import GlossaryProcessor
+from src.history.store import HistoryStore
+from src.llm.translate import TranslateProcessor
+from src.persona import PROVIDER_LABELS, PersonaProcessor
 
 # 版本信息
 __version__ = "3.3.0"
@@ -36,6 +42,7 @@ class TranscriptionJob:
     archive_path: Optional[str] = None
     retries_left: int = 0
     attempt: int = 1
+    duration_seconds: Optional[float] = None
 
 
 def check_microphone_permissions():
@@ -55,9 +62,39 @@ class VoiceAssistant:
     def __init__(self, openai_processor, local_processor, doubao_processor):
         self.audio_recorder = AudioRecorder()
         self.audio_archive = AudioArchiveManager()
+        self.history_store = HistoryStore()
         self.openai_processor = openai_processor  # OpenAI GPT-4o transcribe
         self.local_processor = local_processor    # 本地 whisper
         self.doubao_processor = doubao_processor  # 豆包流式 ASR
+        self.translate_processor = TranslateProcessor()
+        self.glossary_processor = GlossaryProcessor()
+        self.persona_processor = PersonaProcessor()
+        logger.info(
+            "词库与纠错已启用: %d 条规则",
+            self.glossary_processor.store.enabled_count(),
+        )
+        if self.persona_processor.enabled:
+            if self.persona_processor.is_enabled():
+                logger.info(
+                    "人设改写已启用: %s / %s / %s",
+                    self.persona_processor.active_name,
+                    PROVIDER_LABELS.get(
+                        self.persona_processor.provider,
+                        self.persona_processor.provider,
+                    ),
+                    self.persona_processor.model,
+                )
+            else:
+                logger.warning("人设改写已开启，但当前模型的 API Key 未配置")
+        if self.translate_processor.is_available():
+            logger.info(
+                "翻译模式已启用: %s / %s -> %s",
+                self.translate_processor.provider,
+                self.translate_processor.model,
+                self.translate_processor.target_label,
+            )
+        else:
+            logger.warning("翻译模式不可用：请配置 DashScope API Key")
         self.job_queue: queue.Queue[TranscriptionJob] = queue.Queue()
         self._current_state = InputState.IDLE
 
@@ -73,6 +110,9 @@ class VoiceAssistant:
         self._streaming_loop: Optional[asyncio.AbstractEventLoop] = None
         self._streaming_thread: Optional[threading.Thread] = None
         self._current_streaming_archive_path: Optional[str] = None
+        self._streaming_started_at: Optional[float] = None
+        self._streaming_duration_seconds: Optional[float] = None
+        self._streaming_history_recorded = False
 
         # 根据配置选择默认转录快捷键的处理方式
         if self.transcription_service == "doubao" and self.doubao_processor and self.doubao_processor.is_available():
@@ -199,6 +239,7 @@ class VoiceAssistant:
         archive_path: Optional[str] = None,
         max_retries: int = 0,
         attempt: int = 1,
+        duration_seconds: Optional[float] = None,
     ) -> None:
         job = TranscriptionJob(
             audio_bytes=audio_bytes,
@@ -207,6 +248,7 @@ class VoiceAssistant:
             archive_path=archive_path,
             retries_left=max(0, max_retries),
             attempt=attempt,
+            duration_seconds=duration_seconds,
         )
         self.job_queue.put(job)
         retry_tag = f" [重试 第{attempt}次]" if attempt > 1 else ""
@@ -233,13 +275,14 @@ class VoiceAssistant:
         )
 
         buffer = io.BytesIO(job.audio_bytes)
+        started_at = time.monotonic()
         try:
             if job.processor == "openai":
                 if self.openai_processor is None:
                     raise RuntimeError("OpenAI 转录服务未配置")
                 processor_result = self.openai_processor.process_audio(
                     buffer,
-                    mode=job.mode,
+                    mode="transcriptions" if job.mode == "translations" else job.mode,
                     prompt="",
                     archive_path=job.archive_path,
                 )
@@ -248,7 +291,7 @@ class VoiceAssistant:
                     raise RuntimeError("本地 Whisper 不可用")
                 processor_result = self.local_processor.process_audio(
                     buffer,
-                    mode=job.mode,
+                    mode="transcriptions" if job.mode == "translations" else job.mode,
                     prompt="",
                     archive_path=job.archive_path,
                 )
@@ -256,7 +299,11 @@ class VoiceAssistant:
                 raise ValueError(f"未知的处理器: {job.processor}")
         except Exception as exc:  # noqa: BLE001
             logger.error(f"{job.processor} 转录发生异常: {exc}", exc_info=True)
-            self._handle_transcription_failure(job, str(exc))
+            self._handle_transcription_failure(
+                job,
+                str(exc),
+                latency_seconds=time.monotonic() - started_at,
+            )
             return
         finally:
             try:
@@ -272,22 +319,114 @@ class VoiceAssistant:
 
         if error:
             logger.error(f"{job.processor} 转录失败: {error}")
-            self._handle_transcription_failure(job, str(error))
+            self._handle_transcription_failure(
+                job,
+                str(error),
+                latency_seconds=time.monotonic() - started_at,
+            )
             return
 
+        text = self.glossary_processor.apply(text)
+        latency_seconds = time.monotonic() - started_at
         service, model = self._get_job_cache_metadata(job)
+        history_mode = job.mode
+        if job.mode == "transcriptions" and self.persona_processor.enabled:
+            persona = self.persona_processor.active_persona
+            if persona is None:
+                logger.warning("人设改写已开启，但没有可用人设，将输入原文")
+            elif not self.persona_processor.is_available():
+                logger.warning("人设改写 API Key 未配置，将输入原文")
+            else:
+                original_text = text
+                self.floating_preview.show()
+                self.floating_preview.update_text(
+                    f"正在按“{persona.name}”改写..."
+                )
+                try:
+                    text = self.persona_processor.rewrite(
+                        text,
+                        persona_id=persona.id,
+                        on_update=self.floating_preview.update_text,
+                    )
+                    used_provider = (
+                        self.persona_processor.last_provider
+                        or self.persona_processor.provider
+                    )
+                    service = f"{service}+persona-{used_provider}"
+                    model = (
+                        f"{model} → "
+                        f"{self.persona_processor.model_for(used_provider)}"
+                    )
+                    history_mode = f"persona:{persona.name}"
+                except Exception as exc:  # noqa: BLE001
+                    text = original_text
+                    logger.error("人设改写失败，将输入原文: %s", exc, exc_info=True)
+                    self.status_controller.show_error("人设改写失败，已输入原文")
+                finally:
+                    self.floating_preview.hide()
+        if job.mode == "translations":
+            if not self.translate_processor.is_available():
+                self._handle_transcription_failure(
+                    job,
+                    "翻译服务不可用，请配置 DashScope API Key",
+                    latency_seconds=latency_seconds,
+                )
+                return
+            self.floating_preview.show()
+            self.floating_preview.update_text(
+                f"正在翻译为{self.translate_processor.target_label}..."
+            )
+            try:
+                text = self.translate_processor.translate(
+                    text,
+                    on_update=self.floating_preview.update_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.floating_preview.hide()
+                self._handle_transcription_failure(
+                    job,
+                    f"翻译失败: {exc}",
+                    latency_seconds=time.monotonic() - started_at,
+                )
+                return
+            self.floating_preview.hide()
+            latency_seconds = time.monotonic() - started_at
+            translation_service = (
+                "aliyun-mt"
+                if self.translate_processor.provider
+                in {"aliyun", "dashscope", "bailian"}
+                else self.translate_processor.provider
+            )
+            service = f"{service}+{translation_service}"
+            model = f"{model} → {self.translate_processor.model}"
         self._save_transcription_cache(
             job.archive_path,
             text,
             service=service,
             model=model,
-            mode=job.mode,
+            mode=history_mode,
+        )
+        self.history_store.add_success(
+            text=text,
+            service=service,
+            model=model,
+            mode=history_mode,
+            duration_seconds=job.duration_seconds,
+            latency_seconds=latency_seconds,
+            audio_path=job.archive_path,
+            attempt=job.attempt,
         )
         self.keyboard_manager.type_text(text, error)
         logger.info(f"✅ 转录成功 (尝试 {job.attempt})")
         self._notify_status()
 
-    def _handle_transcription_failure(self, job: TranscriptionJob, error_message: str):
+    def _handle_transcription_failure(
+        self,
+        job: TranscriptionJob,
+        error_message: str,
+        *,
+        latency_seconds: Optional[float] = None,
+    ):
         if job.retries_left > 0:
             logger.warning(
                 "⚠️ %s 转录失败 (尝试 %d)，将在 %d 次内自动重试",
@@ -299,6 +438,17 @@ class VoiceAssistant:
             self._notify_status()
             return
 
+        service, model = self._get_job_cache_metadata(job)
+        self.history_store.add_failure(
+            error=error_message,
+            service=service,
+            model=model,
+            mode=job.mode,
+            duration_seconds=job.duration_seconds,
+            latency_seconds=latency_seconds,
+            audio_path=job.archive_path,
+            attempt=job.attempt,
+        )
         logger.error(
             "❌ %s 转录失败 (尝试 %d)，自动重试已用尽: %s",
             job.processor,
@@ -317,12 +467,24 @@ class VoiceAssistant:
             archive_path=job.archive_path,
             max_retries=next_retries,
             attempt=job.attempt + 1,
+            duration_seconds=job.duration_seconds,
         )
 
     def _archive_audio_bytes(self, audio_bytes: Optional[bytes]) -> Optional[str]:
         if not audio_bytes:
             return None
         return self.audio_archive.save_audio_bytes(audio_bytes)
+
+    @staticmethod
+    def _audio_duration_seconds(audio_bytes: bytes) -> Optional[float]:
+        try:
+            with wave.open(io.BytesIO(audio_bytes), "rb") as audio_file:
+                frame_rate = audio_file.getframerate()
+                if frame_rate <= 0:
+                    return None
+                return audio_file.getnframes() / float(frame_rate)
+        except (EOFError, wave.Error):
+            return None
 
     def _save_transcription_cache(
         self,
@@ -385,6 +547,7 @@ class VoiceAssistant:
             "openai",
             archive_path=archive_path,
             max_retries=self.max_auto_retries,
+            duration_seconds=self._audio_duration_seconds(audio_bytes),
         )
 
     def start_local_recording(self):
@@ -412,13 +575,23 @@ class VoiceAssistant:
             return
 
         archive_path = self._archive_audio_bytes(audio_bytes)
-        self._queue_job(audio_bytes, "local", archive_path=archive_path)
+        self._queue_job(
+            audio_bytes,
+            "local",
+            archive_path=archive_path,
+            duration_seconds=self._audio_duration_seconds(audio_bytes),
+        )
 
     def start_translation_recording(self):
         """开始录音（翻译模式）"""
         if self.openai_processor is None:
-            logger.warning("翻译模式需要 OpenAI，请配置 OFFICIAL_OPENAI_API_KEY")
-            self.status_controller.show_error("翻译模式需要 OpenAI")
+            logger.warning("翻译模式需要可用的批量 ASR 服务")
+            self.status_controller.show_error("翻译模式缺少批量 ASR")
+            self.keyboard_manager.reset_state()
+            return
+        if not self.translate_processor.is_available():
+            logger.warning("翻译模式需要 DashScope API Key")
+            self.status_controller.show_error("翻译服务未配置")
             self.keyboard_manager.reset_state()
             return
         self.audio_recorder.start_recording()
@@ -444,6 +617,7 @@ class VoiceAssistant:
             mode="translations",
             archive_path=archive_path,
             max_retries=self.max_auto_retries,
+            duration_seconds=self._audio_duration_seconds(audio_bytes),
         )
 
     def start_doubao_streaming(self):
@@ -461,6 +635,9 @@ class VoiceAssistant:
             return
 
         self._current_streaming_archive_path = None
+        self._streaming_started_at = time.monotonic()
+        self._streaming_duration_seconds = None
+        self._streaming_history_recorded = False
         self._current_state = InputState.DOUBAO_STREAMING
         self._notify_status()
 
@@ -501,6 +678,7 @@ class VoiceAssistant:
         def on_final_text(text: str):
             """流式结束，一次性输入最终文本到目标应用"""
             if text:
+                text = self.glossary_processor.apply(text)
                 logger.info(f"[最终输入] {text}")
                 self._save_transcription_cache(
                     self._current_streaming_archive_path,
@@ -509,6 +687,22 @@ class VoiceAssistant:
                     model="bigmodel",
                     mode="transcriptions",
                 )
+                if not self._streaming_history_recorded:
+                    latency_seconds = (
+                        time.monotonic() - self._streaming_started_at
+                        if self._streaming_started_at is not None
+                        else None
+                    )
+                    self.history_store.add_success(
+                        text=text,
+                        service="doubao",
+                        model="bigmodel",
+                        mode="transcriptions",
+                        duration_seconds=self._streaming_duration_seconds,
+                        latency_seconds=latency_seconds,
+                        audio_path=self._current_streaming_archive_path,
+                    )
+                    self._streaming_history_recorded = True
                 self.keyboard_manager.type_text(text, None)
 
         def on_complete():
@@ -523,6 +717,21 @@ class VoiceAssistant:
             logger.error(f"❌ 豆包流式转录错误: {error}")
             self.floating_preview.hide()
             self.audio_recorder.reset_streaming_state(reason=f"豆包流式错误: {error}")
+            if not self._streaming_history_recorded:
+                latency_seconds = (
+                    time.monotonic() - self._streaming_started_at
+                    if self._streaming_started_at is not None
+                    else None
+                )
+                self.history_store.add_failure(
+                    error=error,
+                    service="doubao",
+                    model="bigmodel",
+                    duration_seconds=self._streaming_duration_seconds,
+                    latency_seconds=latency_seconds,
+                    audio_path=self._current_streaming_archive_path,
+                )
+                self._streaming_history_recorded = True
             self.keyboard_manager.reset_state()
 
         # 豆包 API 只支持 16000Hz，stream_audio_chunks 会自动重采样
@@ -547,6 +756,7 @@ class VoiceAssistant:
         audio = self.audio_recorder.stop_streaming_recording()
         audio_bytes = self._buffer_to_bytes(audio)
         if audio_bytes:
+            self._streaming_duration_seconds = self._audio_duration_seconds(audio_bytes)
             self._current_streaming_archive_path = self._archive_audio_bytes(audio_bytes)
 
     def reset_state(self):
@@ -595,11 +805,15 @@ def main():
             logger.warning(f"本地 Whisper 不可用，将禁用本地转录功能: {e}")
             local_processor = None
 
-        # 创建豆包流式处理器（可选，如果 API Key 未配置则跳过）
-        doubao_processor = DoubaoStreamingProcessor()
-        if not doubao_processor.is_available():
-            logger.warning("豆包流式 ASR 不可用（未配置 API Key），将使用批量转录服务作为默认转录服务")
-            doubao_processor = None
+        # 豆包流式 ASR 只保留旧配置兼容；新控制台不再提供该选项。
+        doubao_processor = None
+        if os.getenv("TRANSCRIPTION_SERVICE", "").strip().lower() == "doubao":
+            doubao_processor = DoubaoStreamingProcessor()
+            if not doubao_processor.is_available():
+                logger.warning(
+                    "旧豆包流式 ASR 配置不可用，将使用批量转录服务"
+                )
+                doubao_processor = None
 
         # 恢复原始环境变量
         if original_platform:

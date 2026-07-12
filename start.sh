@@ -3,7 +3,7 @@
 # Whisper-Input-Next 启动脚本 v2.0.0
 # 用于启动语音转录工具
 
-echo "🚀 启动 Whisper-Input-Next 语音转录工具..."
+echo "🚀 启动小凯哥语音输入法..."
 
 SESSION_NAME="whisper-input"
 
@@ -61,9 +61,10 @@ tmux send-keys -t "$SESSION_NAME" "python main.py 2>&1 | tee $LOG_FILE" C-m
 
 # 连接到会话
 echo ""
-echo "✅ Whisper-Input-Next 已启动！"
+echo "✅ 小凯哥语音输入法已启动！"
 echo "📋 快捷键说明："
-echo "   Win+F: 默认转录服务"
+echo "   按住右 Alt: 普通语音转写"
+echo "   按住右 Command: 转写并翻译到配置的目标语言"
 echo "   Win+I: 本地 Whisper 转录 (省钱)"
 echo ""
 echo "🔧 会话管理："

@@ -1,4 +1,4 @@
-"""macOS 状态栏控制器，显示 Whisper-Input 的运行状态。"""
+"""macOS 状态栏控制器，显示小凯哥语音输入法的运行状态。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from Cocoa import (
 from PyObjCTools import AppHelper
 
 from src.keyboard.inputState import InputState
+
+APP_NAME = "小凯哥语音输入法"
 
 
 @dataclass(frozen=True)
@@ -94,11 +96,11 @@ class StatusBarController:
         button = self._status_item.button()
         if button is not None:
             button.setTitle_("🎙️")
-            button.setToolTip_("Whisper-Input - 空闲")
+            button.setToolTip_(f"{APP_NAME} - 空闲")
 
         self._menu = NSMenu.alloc().init()
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Quit Whisper-Input", "terminate:", ""
+            f"退出{APP_NAME}", "terminate:", ""
         )
         self._menu.addItem_(quit_item)
         self._status_item.setMenu_(self._menu)
@@ -141,7 +143,7 @@ class StatusBarController:
             # 使用自定义图片时将排队数量显示为文字
             title = f" {self._queue_length if self._queue_length < 10 else '*'}"
 
-        tooltip = f"Whisper-Input - {visual.description}"
+        tooltip = f"{APP_NAME} - {visual.description}"
         if self._queue_length:
             tooltip += f" | 待处理任务 {self._queue_length}"
 

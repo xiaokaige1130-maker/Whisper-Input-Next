@@ -16,8 +16,8 @@ ln -sf "$APP_DIR/launch-service.sh" "$LOCAL_BIN/whisper-input-start"
 cat > "$APP_DESKTOP_DIR/whisper-input-control.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Whisper Input 控制台
-Comment=启动、停止和调试 AI 语音输入
+Name=小凯哥语音输入法
+Comment=语音转写、实时翻译和历史记录
 Exec=$APP_DIR/launch-control-ui.sh
 Icon=$APP_DIR/assets/icons/whisper-input.png
 Terminal=false
@@ -28,8 +28,8 @@ EOF
 cat > "$AUTOSTART_DIR/whisper-input-service.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Whisper Input Service
-Comment=Start AI voice input service after login
+Name=小凯哥语音输入法后台服务
+Comment=登录后启动语音输入与翻译快捷键
 Exec=$APP_DIR/launch-service.sh
 Icon=$APP_DIR/assets/icons/whisper-input.png
 Terminal=false
@@ -39,6 +39,6 @@ EOF
 chmod +x "$APP_DESKTOP_DIR/whisper-input-control.desktop" "$AUTOSTART_DIR/whisper-input-service.desktop"
 update-desktop-database "$APP_DESKTOP_DIR" >/dev/null 2>&1 || true
 
-echo "Installed Whisper Input user app."
-echo "Open it from the application menu: Whisper Input 控制台"
+echo "Installed 小凯哥语音输入法."
+echo "Open it from the application menu: 小凯哥语音输入法"
 echo "CLI commands: whisper-input-control, whisper-input-start"

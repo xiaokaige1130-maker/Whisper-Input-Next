@@ -1,4 +1,4 @@
-# Whisper-Input-Next - Enhanced Voice Transcription Tool
+# 小凯哥语音输入法
 
 <p align="center">
   <img src="docs/whisper_claudecode.png" alt="Project Poster" />
@@ -19,7 +19,7 @@
   </a>
 </p>
 
-An intelligent voice transcription input tool supporting multiple transcription services and high-quality speech recognition features.
+基于 Whisper-Input-Next 开发的个人 AI 语音输入工具，支持中文听写、多语言翻译和转写历史。
 
 ## 💰 Why Pay $12/Month? Use Open Source Instead!
 
@@ -64,6 +64,83 @@ This project is based on [ErlichLiu/Whisper-Input](https://github.com/ErlichLiu/
 - **One-click Retry**: Failed transcriptions can be retried without re-recording
 - **Real-time Input**: Transcription results appear directly at cursor position
 - **Privacy Protection**: Local processing option, data not uploaded
+
+## 当前桌面版：语音转写与多语言翻译
+
+当前版本提供新的 PyQt5 控制台、SQLite 转写历史，以及独立的语音翻译快捷键。翻译不是由 ASR 单独完成，而是采用两段式模型链路：
+
+```text
+中文语音
+  -> 阿里云 Qwen ASR（语音转中文文字）
+  -> 阿里云 Qwen-MT（中文翻译为目标语言）
+  -> 流式预览并粘贴到当前输入框
+```
+
+默认操作：
+
+| 操作 | 功能 |
+|------|------|
+| 按住右 `Alt`，松开 | 普通语音转写 |
+| 按住右 `Command`，松开 | 识别中文并翻译为目标语言 |
+| 打开“快捷键与文本” | 切换英语、日语、俄语等目标语言 |
+| 打开“历史记录” | 查看成功、失败、耗时、模型和翻译结果 |
+
+苹果键盘使用右 `Command` 作为翻译快捷键，对应配置值 `cmd_r`。
+
+翻译默认复用阿里云 DashScope 密钥，不需要额外的 OpenAI 密钥。核心配置如下：
+
+```bash
+TRANSCRIPTION_SERVICE=aliyun
+BATCH_TRANSCRIPTION_SERVICE=aliyun
+DASHSCOPE_API_KEY=your_dashscope_key
+DASHSCOPE_ASR_MODEL=qwen3-asr-flash
+
+TRANSLATION_SERVICE=aliyun
+TRANSLATION_TARGET_LANGUAGE=en
+DASHSCOPE_TRANSLATION_MODEL=qwen-mt-flash
+TRANSLATION_HOTKEY=cmd_r
+TRANSLATION_HOTKEY_MODE=hold
+
+TRANSCRIPTION_HOTKEY=alt_r
+TRANSCRIPTION_HOTKEY_MODE=hold
+```
+
+`TRANSLATION_TARGET_LANGUAGE` 支持 `en`、`ja`、`ru`、`ko`、`fr`、`de`、`es`、`pt`、`it`、`ar` 和 `zh`。修改控制台设置后点击“保存并重启”即可加载新目标语言。
+
+### 人设与实时改写
+
+控制台提供独立的“人设与改写”页面。开启后，普通听写按“语音识别 → 词库纠错 → 人设改写 → 粘贴”的顺序处理；翻译快捷键仍走独立翻译链路。
+
+内置人设包括文言文、网络热梗、AI 提示词和正式表达，也可以创建自定义人设。改写模型可在阿里云 Qwen Flash 与火山方舟 Doubao Seed 之间切换，并可配置失败备用模型。
+
+```bash
+PERSONA_REWRITE_ENABLED=true
+PERSONA_REWRITE_PROVIDER=qwen
+PERSONA_FALLBACK_PROVIDER=ark
+QWEN_REWRITE_MODEL=qwen-flash
+ARK_API_KEY=your_ark_key
+ARK_REWRITE_MODEL=doubao-seed-2-0-mini-260428
+```
+
+Qwen 改写复用 `DASHSCOPE_API_KEY`。Qwen 和火山方舟都关闭思考模式，避免实时输入时把时间和输出额度消耗在推理内容上；如果所有改写模型都失败，程序会输入原始转写结果。
+
+### 词库与自动纠错
+
+控制台提供独立的“词库与纠错”页面。每个词条由“口述形式”和“输出结果”组成，保存后无需重启，下一次语音输入立即生效。
+
+| 口述形式 | 输出结果 |
+|----------|----------|
+| `S S H` | `SSH` |
+| `V P S` | `VPS` |
+| `香港杠` | `香港-` |
+
+词库会应用于普通转写、翻译前的中文原文和流式识别结果。词条可以单独停用、搜索、编辑或删除。
+
+启动控制台：
+
+```bash
+./launch-control-ui.sh
+```
 
 ## 📦 Quick Start
 

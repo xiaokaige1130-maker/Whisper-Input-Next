@@ -22,6 +22,8 @@ except Exception:  # noqa: BLE001
 
     logger = logging.getLogger(__name__)
 
+APP_NAME = "小凯哥语音输入法"
+
 
 @dataclass(frozen=True)
 class _StateVisual:
@@ -30,25 +32,28 @@ class _StateVisual:
 
 
 _STATE_VISUALS = {
-    InputState.IDLE: _StateVisual("#2f8f46", "Whisper-Input - idle"),
-    InputState.RECORDING: _StateVisual("#c43131", "Whisper-Input - recording"),
+    InputState.IDLE: _StateVisual("#2f8f46", f"{APP_NAME} - 空闲"),
+    InputState.RECORDING: _StateVisual("#c43131", f"{APP_NAME} - 录音中"),
     InputState.RECORDING_TRANSLATE: _StateVisual(
         "#c43131",
-        "Whisper-Input - recording translate",
+        f"{APP_NAME} - 翻译录音中",
     ),
     InputState.RECORDING_KIMI: _StateVisual(
         "#d97917",
-        "Whisper-Input - recording local",
+        f"{APP_NAME} - 本地录音中",
     ),
-    InputState.DOUBAO_STREAMING: _StateVisual("#23845d", "Whisper-Input - streaming"),
-    InputState.PROCESSING: _StateVisual("#2f6fb4", "Whisper-Input - transcribing"),
+    InputState.DOUBAO_STREAMING: _StateVisual(
+        "#23845d",
+        f"{APP_NAME} - 流式识别中",
+    ),
+    InputState.PROCESSING: _StateVisual("#2f6fb4", f"{APP_NAME} - 转写中"),
     InputState.PROCESSING_KIMI: _StateVisual(
         "#2f6fb4",
-        "Whisper-Input - transcribing local",
+        f"{APP_NAME} - 本地转写中",
     ),
-    InputState.TRANSLATING: _StateVisual("#b19625", "Whisper-Input - translating"),
-    InputState.WARNING: _StateVisual("#b19625", "Whisper-Input - warning"),
-    InputState.ERROR: _StateVisual("#b3261e", "Whisper-Input - error"),
+    InputState.TRANSLATING: _StateVisual("#b19625", f"{APP_NAME} - 翻译中"),
+    InputState.WARNING: _StateVisual("#b19625", f"{APP_NAME} - 警告"),
+    InputState.ERROR: _StateVisual("#b3261e", f"{APP_NAME} - 错误"),
 }
 
 
@@ -118,13 +123,14 @@ class _QtRuntime:
 
         app = QApplication.instance()
         if app is None:
-            app = QApplication(["whisper-input-next"])
+            app = QApplication(["kaige-voice-input"])
+        app.setApplicationName(APP_NAME)
         app.setQuitOnLastWindowClosed(False)
         self._app = app
 
         if QSystemTrayIcon.isSystemTrayAvailable():
             menu = QMenu()
-            quit_action = QAction("Quit Whisper-Input")
+            quit_action = QAction(f"退出{APP_NAME}")
             quit_action.triggered.connect(app.quit)
             menu.addAction(quit_action)
 
@@ -189,7 +195,7 @@ class _QtRuntime:
             and error_message != self._last_notified_error
             and self._qt["QSystemTrayIcon"].supportsMessages()
         ):
-            self._tray.showMessage("Whisper-Input", error_message)
+            self._tray.showMessage(APP_NAME, error_message)
             self._last_notified_error = error_message
 
     def _update_preview(self, visible: bool, text: str) -> None:
