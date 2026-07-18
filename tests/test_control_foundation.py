@@ -4,6 +4,8 @@ import os
 import io
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from unittest.mock import Mock, call, patch
 from pynput.keyboard import Key, KeyCode
 
 from main import VoiceAssistant
+from src.agent import KnowledgeAgent
 from src.control.config_store import EnvStore
 from src.correction import CorrectionProcessor
 from src.glossary import GlossaryProcessor, GlossaryStore
@@ -26,6 +29,7 @@ from src.keyboard.paste_strategy import (
 from src.llm.translate import TranslateProcessor
 from src.memory import PersonalMemoryStore
 from src.persona import PersonaProcessor, PersonaStore
+from src.smart import SelectedTextProcessor, VoiceEditProcessor
 from src.terminal_mode import TerminalTextProcessor
 from src.text_processing import TextPostProcessor
 
@@ -116,6 +120,29 @@ class HistoryStoreTests(unittest.TestCase):
                 [record.text for record in store.recent(10)],
                 ["record-4", "record-3"],
             )
+
+    def test_successful_texts_returns_only_recent_successes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "history.db"
+            store = HistoryStore(path)
+            old_id = store.add_success(
+                text="old",
+                service="aliyun",
+                model="qwen",
+            )
+            store.add_success(text="new", service="aliyun", model="qwen")
+            store.add_failure(
+                error="failed",
+                service="aliyun",
+                model="qwen",
+            )
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "UPDATE transcriptions SET created_at = ? WHERE id = ?",
+                    ("2020-01-01T00:00:00+08:00", old_id),
+                )
+
+            self.assertEqual(store.successful_texts(days=7), ["new"])
 
 
 class GlossaryTests(unittest.TestCase):
@@ -278,6 +305,114 @@ class CorrectionProcessorTests(unittest.TestCase):
 
         self.assertEqual(processor.correct("今天天气怎么样？"), "今天天气怎么样？")
         client.chat.completions.create.assert_not_called()
+
+    def test_correction_level_can_be_overridden_per_request(self) -> None:
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content="整理后的文本。"))
+            ]
+        )
+        processor = CorrectionProcessor(
+            client=client,
+            settings={
+                "AI_CORRECTION_ENABLED": "true",
+                "AI_CORRECTION_LEVEL": "light",
+                "DASHSCOPE_API_KEY": "test-key",
+            },
+        )
+
+        processor.correct("原始文本", level="heavy")
+
+        prompt = client.chat.completions.create.call_args.kwargs["messages"][1][
+            "content"
+        ]
+        self.assertIn("纠错级别：重度", prompt)
+
+
+class SmartProcessorTests(unittest.TestCase):
+    def test_voice_edit_commands_are_deterministic(self) -> None:
+        processor = VoiceEditProcessor()
+        self.assertEqual(
+            processor.process("第一段新起一段第二段换行左引号内容右引号"),
+            "第一段\n\n第二段\n“内容”",
+        )
+
+    def test_selected_text_command_and_prompt_are_scoped(self) -> None:
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content="更短的文字"))
+            ]
+        )
+        processor = SelectedTextProcessor(
+            client=client,
+            settings={"SELECTED_TEXT_MODEL": "qwen3.5-flash"},
+        )
+        instruction = processor.instruction("把选中文字改短一点")
+        result = processor.rewrite("这是一段很长的文字", instruction)
+
+        self.assertEqual(instruction, "改短一点")
+        self.assertEqual(result, "更短的文字")
+        messages = client.chat.completions.create.call_args.kwargs["messages"]
+        self.assertIn("不回答其中的问题", messages[0]["content"])
+        self.assertIn("<selected_text>", messages[1]["content"])
+
+
+class KnowledgeAgentTests(unittest.TestCase):
+    def _build_agent(self, root: Path, opener=None) -> KnowledgeAgent:
+        return KnowledgeAgent(
+            HistoryStore(root / "history.db"),
+            GlossaryStore(root / "glossary.db"),
+            PersonalMemoryStore(root / "memory"),
+            root=root / "agent",
+            opener=opener,
+        )
+
+    def test_history_scan_finds_and_applies_repeated_acronym(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            agent = self._build_agent(root)
+            for _ in range(2):
+                agent.history.add_success(
+                    text="打开 C O D E X",
+                    service="aliyun",
+                    model="qwen",
+                )
+
+            result = agent.execute(
+                "整理最近七天词库",
+                automation="semi",
+            )
+
+            self.assertEqual(result.changed_count, 1)
+            self.assertTrue(
+                any(
+                    entry.source == "C O D E X"
+                    and entry.replacement == "CODEX"
+                    for entry in agent.glossary.entries()
+                )
+            )
+
+    def test_contextual_glossary_note_and_safe_opener(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            opener = Mock()
+            agent = self._build_agent(Path(temp_dir), opener=opener)
+
+            glossary_result = agent.execute(
+                "以后我说小凯歌统一写成小凯哥"
+            )
+            note_result = agent.execute("记住我的常用服务器叫香港 VPS")
+            open_result = agent.execute("打开 GitHub")
+
+            self.assertEqual(glossary_result.changed_count, 1)
+            self.assertEqual(note_result.changed_count, 1)
+            self.assertEqual(open_result.action, "open")
+            opener.assert_called_once_with("url", "https://github.com")
+            notes = (
+                agent.memory.knowledge_dir / "agent_notes.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("香港 VPS", notes)
 
 
 class TranslateProcessorTests(unittest.TestCase):
@@ -605,8 +740,62 @@ class PersonalMemoryStoreTests(unittest.TestCase):
 
 
 class KeyboardManagerTests(unittest.TestCase):
+    @staticmethod
+    def _custom_manager() -> KeyboardManager:
+        manager = KeyboardManager.__new__(KeyboardManager)
+        manager.custom_hotkeys = {
+            "fast": ("alt_r",),
+            "smart": ("cmd_r",),
+            "translation": ("cmd_r", "e"),
+            "agent": ("alt_r", "a"),
+        }
+        manager.hotkey_chord_delay = 0.05
+        manager._custom_lock = threading.RLock()
+        manager._custom_pressed_tokens = set()
+        manager._custom_pending_timers = {}
+        manager._custom_active_action = None
+        manager._direct_agent_recording = False
+        manager.agent_mode_enabled = True
+        manager.agent_mode_active = False
+        manager.agent_mode_key_pressed = False
+        manager.terminal_mode_active = False
+        manager.terminal_mode_key_pressed = False
+        manager.is_recording = False
+        manager._state = InputState.IDLE
+        manager._state_messages = {
+            InputState.RECORDING: "0",
+            InputState.RECORDING_SMART: "0",
+            InputState.RECORDING_TRANSLATE: "0",
+            InputState.RECORDING_AGENT: "0",
+            InputState.PROCESSING: "1",
+            InputState.PROCESSING_SMART: "1",
+            InputState.PROCESSING_AGENT: "1",
+            InputState.TRANSLATING: "1",
+        }
+        manager.temp_text_length = 0
+        manager.processing_text = None
+        manager.state_symbol_enabled = False
+        manager.on_record_start = Mock()
+        manager.on_record_stop = Mock()
+        manager.on_smart_start = Mock()
+        manager.on_smart_stop = Mock()
+        manager.on_translate_start = Mock()
+        manager.on_translate_stop = Mock()
+        manager.on_agent_start = Mock()
+        manager.on_agent_stop = Mock()
+        manager.on_state_change = None
+        return manager
+
     def test_right_command_aliases_are_supported(self) -> None:
         self.assertEqual(KeyboardManager._parse_button("cmd_r"), Key.cmd_r)
+        self.assertEqual(
+            KeyboardManager._parse_button("cmd_l"),
+            getattr(Key, "cmd_l", Key.cmd),
+        )
+        self.assertEqual(
+            KeyboardManager._parse_button("alt_l"),
+            getattr(Key, "alt_l", Key.alt),
+        )
         self.assertEqual(
             KeyboardManager._parse_button("right_command"),
             Key.cmd_r,
@@ -619,6 +808,18 @@ class KeyboardManagerTests(unittest.TestCase):
         self.assertTrue(
             KeyboardManager._key_matches(KeyCode.from_char(">"), ">")
         )
+        self.assertEqual(
+            KeyboardManager._parse_hotkey("cmd_r+e"),
+            ("cmd_r", "e"),
+        )
+        self.assertEqual(KeyboardManager._parse_hotkey("cmd_r+cmd_r"), ())
+
+    def test_side_specific_modifier_matching_keeps_left_and_right_separate(self) -> None:
+        self.assertTrue(KeyboardManager._key_matches_token(Key.alt, "alt_l"))
+        self.assertFalse(KeyboardManager._key_matches_token(Key.alt_r, "alt_l"))
+        self.assertTrue(KeyboardManager._key_matches_token(Key.alt_r, "alt_r"))
+        self.assertTrue(KeyboardManager._key_matches_token(Key.alt, "alt"))
+        self.assertTrue(KeyboardManager._key_matches_token(Key.alt_r, "alt"))
 
     def test_terminal_mode_marks_only_the_current_recording(self) -> None:
         manager = KeyboardManager.__new__(KeyboardManager)
@@ -627,6 +828,8 @@ class KeyboardManagerTests(unittest.TestCase):
         manager.terminal_mode_key_display = ">"
         manager.terminal_mode_key_pressed = False
         manager.terminal_mode_active = False
+        manager.agent_mode_enabled = False
+        manager.dual_input_mode_enabled = False
         manager.is_recording = True
         manager._state = InputState.RECORDING
         manager._state_messages = {InputState.RECORDING_TERMINAL: "0"}
@@ -640,6 +843,89 @@ class KeyboardManagerTests(unittest.TestCase):
         self.assertEqual(manager.state, InputState.RECORDING_TERMINAL)
         self.assertTrue(manager.consume_terminal_mode())
         self.assertFalse(manager.terminal_mode_active)
+
+    def test_dual_mode_off_keeps_translation_route(self) -> None:
+        manager = KeyboardManager.__new__(KeyboardManager)
+        manager.dual_input_mode_enabled = False
+        manager.toggle_smart_recording = Mock()
+        manager.last_key_time = 0
+        manager.KEY_DEBOUNCE_TIME = 0
+        manager.is_recording = False
+        manager._state = InputState.IDLE
+        manager._state_messages = {InputState.RECORDING_TRANSLATE: "0"}
+        manager.temp_text_length = 0
+        manager.state_symbol_enabled = False
+        manager.on_translate_start = Mock()
+        manager.on_state_change = None
+
+        manager.toggle_translation_recording()
+
+        manager.toggle_smart_recording.assert_not_called()
+        self.assertEqual(manager.state, InputState.RECORDING_TRANSLATE)
+        manager.on_translate_start.assert_called_once()
+
+    def test_command_chord_wins_over_command_single_key(self) -> None:
+        manager = self._custom_manager()
+
+        manager._handle_custom_press(Key.cmd_r)
+        manager._handle_custom_press(KeyCode.from_char("e"))
+        time.sleep(0.08)
+
+        self.assertEqual(manager.state, InputState.RECORDING_TRANSLATE)
+        manager.on_translate_start.assert_called_once()
+        manager.on_smart_start.assert_not_called()
+
+        manager._handle_custom_release(KeyCode.from_char("e"))
+        self.assertEqual(manager.state, InputState.TRANSLATING)
+        manager.on_translate_stop.assert_called_once()
+
+    def test_option_single_key_starts_fast_after_chord_delay(self) -> None:
+        manager = self._custom_manager()
+
+        manager._handle_custom_press(Key.alt_r)
+        time.sleep(0.08)
+
+        self.assertEqual(manager.state, InputState.RECORDING)
+        manager.on_record_start.assert_called_once()
+        manager.on_agent_start.assert_not_called()
+
+        manager._handle_custom_release(Key.alt_r)
+        manager.on_record_stop.assert_called_once()
+
+    def test_option_agent_chord_uses_independent_agent_callbacks(self) -> None:
+        manager = self._custom_manager()
+
+        manager._handle_custom_press(Key.alt_r)
+        manager._handle_custom_press(KeyCode.from_char("a"))
+        time.sleep(0.08)
+
+        self.assertEqual(manager.state, InputState.RECORDING_AGENT)
+        manager.on_agent_start.assert_called_once()
+        manager.on_record_start.assert_not_called()
+
+        manager._handle_custom_release(KeyCode.from_char("a"))
+        self.assertEqual(manager.state, InputState.PROCESSING_AGENT)
+        manager.on_agent_stop.assert_called_once()
+
+    def test_agent_mode_marks_only_the_current_recording(self) -> None:
+        manager = KeyboardManager.__new__(KeyboardManager)
+        manager.agent_mode_enabled = True
+        manager.agent_mode_key = "a"
+        manager.agent_mode_key_pressed = False
+        manager.agent_mode_active = False
+        manager._direct_agent_recording = False
+        manager.terminal_mode_active = False
+        manager.is_recording = True
+        manager._state = InputState.RECORDING
+        manager._state_messages = {InputState.RECORDING_AGENT: "0"}
+        manager.processing_text = None
+        manager.on_state_change = None
+        manager.state_symbol_enabled = False
+
+        self.assertTrue(manager.activate_agent_mode())
+        self.assertEqual(manager.state, InputState.RECORDING_AGENT)
+        self.assertTrue(manager.consume_agent_mode())
+        self.assertFalse(manager.agent_mode_active)
 
     def test_shift_insert_paste_mode_sends_special_key_sequence(self) -> None:
         manager = KeyboardManager.__new__(KeyboardManager)
@@ -765,7 +1051,9 @@ class VoiceAssistantTerminalModeTests(unittest.TestCase):
     def test_terminal_recording_is_queued_with_terminal_mode(self) -> None:
         assistant = VoiceAssistant.__new__(VoiceAssistant)
         assistant.keyboard_manager = Mock()
+        assistant.keyboard_manager.consume_agent_mode.return_value = False
         assistant.keyboard_manager.consume_terminal_mode.return_value = True
+        assistant.dual_input_mode_enabled = False
         assistant.audio_recorder = Mock()
         assistant.audio_recorder.stop_recording.return_value = io.BytesIO(
             b"recorded-audio"
@@ -781,6 +1069,47 @@ class VoiceAssistantTerminalModeTests(unittest.TestCase):
         call_kwargs = assistant._queue_job.call_args.kwargs
         self.assertEqual(call_kwargs["mode"], "terminal")
         self.assertEqual(call_kwargs["duration_seconds"], 1.5)
+
+    def test_dual_mode_normal_recording_is_queued_as_fast(self) -> None:
+        assistant = VoiceAssistant.__new__(VoiceAssistant)
+        assistant.keyboard_manager = Mock()
+        assistant.keyboard_manager.consume_agent_mode.return_value = False
+        assistant.keyboard_manager.consume_terminal_mode.return_value = False
+        assistant.dual_input_mode_enabled = True
+        assistant.audio_recorder = Mock()
+        assistant.audio_recorder.stop_recording.return_value = io.BytesIO(
+            b"recorded-audio"
+        )
+        assistant.max_auto_retries = 5
+        assistant._archive_audio_bytes = Mock(return_value=None)
+        assistant._audio_duration_seconds = Mock(return_value=1.5)
+        assistant._queue_job = Mock()
+
+        assistant.stop_openai_recording()
+
+        self.assertEqual(
+            assistant._queue_job.call_args.kwargs["mode"],
+            "fast",
+        )
+
+    def test_direct_agent_recording_is_queued_as_agent(self) -> None:
+        assistant = VoiceAssistant.__new__(VoiceAssistant)
+        assistant.keyboard_manager = Mock()
+        assistant.audio_recorder = Mock()
+        assistant.audio_recorder.stop_recording.return_value = io.BytesIO(
+            b"agent-audio"
+        )
+        assistant.max_auto_retries = 5
+        assistant._archive_audio_bytes = Mock(return_value=None)
+        assistant._audio_duration_seconds = Mock(return_value=1.2)
+        assistant._queue_job = Mock()
+
+        assistant.stop_agent_recording()
+
+        self.assertEqual(
+            assistant._queue_job.call_args.kwargs["mode"],
+            "agent",
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from pynput.keyboard import Controller, Key, Listener
 import pyperclip
 from ..utils.logger import logger
+import threading
 import time
 from .inputState import InputState
 from .paste_strategy import detect_active_window, resolve_paste_hotkey
@@ -17,9 +18,9 @@ class KeyboardManager:
         "control_r": Key.ctrl_r,
         "cmd": Key.cmd,
         "command": Key.cmd,
-        "cmd_l": Key.cmd,
-        "command_l": Key.cmd,
-        "left_command": Key.cmd,
+        "cmd_l": getattr(Key, "cmd_l", Key.cmd),
+        "command_l": getattr(Key, "cmd_l", Key.cmd),
+        "left_command": getattr(Key, "cmd_l", Key.cmd),
         "cmd_r": Key.cmd_r,
         "command_r": Key.cmd_r,
         "right_command": Key.cmd_r,
@@ -28,9 +29,9 @@ class KeyboardManager:
         "super": Key.cmd,
         "alt": Key.alt,
         "option": Key.alt,
-        "alt_l": Key.alt,
-        "option_l": Key.alt,
-        "left_option": Key.alt,
+        "alt_l": getattr(Key, "alt_l", Key.alt),
+        "option_l": getattr(Key, "alt_l", Key.alt),
+        "left_option": getattr(Key, "alt_l", Key.alt),
         "alt_r": Key.alt_r,
         "option_r": Key.alt_r,
         "right_option": Key.alt_r,
@@ -64,8 +65,42 @@ class KeyboardManager:
         "right_option": "Right Option",
         "alt_gr": "AltGr",
     }
+    SIDE_SPECIFIC_ALIASES = {
+        "ctrl_l": Key.ctrl_l,
+        "control_l": Key.ctrl_l,
+        "ctrl_r": Key.ctrl_r,
+        "control_r": Key.ctrl_r,
+        "cmd_l": getattr(Key, "cmd_l", Key.cmd),
+        "command_l": getattr(Key, "cmd_l", Key.cmd),
+        "left_command": getattr(Key, "cmd_l", Key.cmd),
+        "cmd_r": Key.cmd_r,
+        "command_r": Key.cmd_r,
+        "right_command": Key.cmd_r,
+        "alt_l": getattr(Key, "alt_l", Key.alt),
+        "option_l": getattr(Key, "alt_l", Key.alt),
+        "left_option": getattr(Key, "alt_l", Key.alt),
+        "alt_r": Key.alt_r,
+        "option_r": Key.alt_r,
+        "right_option": Key.alt_r,
+        "shift_l": getattr(Key, "shift_l", Key.shift),
+        "shift_r": Key.shift_r,
+    }
 
-    def __init__(self, on_record_start, on_record_stop, on_translate_start, on_translate_stop, on_kimi_start, on_kimi_stop, on_reset_state, on_state_change=None):
+    def __init__(
+        self,
+        on_record_start,
+        on_record_stop,
+        on_translate_start,
+        on_translate_stop,
+        on_kimi_start,
+        on_kimi_stop,
+        on_reset_state,
+        on_state_change=None,
+        on_smart_start=None,
+        on_smart_stop=None,
+        on_agent_start=None,
+        on_agent_stop=None,
+    ):
         self.keyboard = Controller()
         self.ctrl_pressed = False  # 快捷键修饰键状态
         self.f_pressed = False  # F键状态
@@ -74,6 +109,9 @@ class KeyboardManager:
         self.single_translation_hotkey_pressed = False
         self.terminal_mode_key_pressed = False
         self.terminal_mode_active = False
+        self.agent_mode_key_pressed = False
+        self.agent_mode_active = False
+        self.single_smart_hotkey_pressed = False
         self.temp_text_length = 0  # 用于跟踪临时文本的长度
         self.processing_text = None  # 用于跟踪正在处理的文本
         self.error_message = None  # 用于跟踪错误信息
@@ -92,6 +130,11 @@ class KeyboardManager:
         self.on_kimi_stop = on_kimi_stop
         self.on_reset_state = on_reset_state
         self.on_state_change = on_state_change
+        self.on_smart_start = on_smart_start or on_record_start
+        self.on_smart_stop = on_smart_stop or on_record_stop
+        self.on_agent_start = on_agent_start or on_record_start
+        self.on_agent_stop = on_agent_stop or on_record_stop
+        self._direct_agent_recording = False
 
         
         # 状态管理
@@ -100,9 +143,13 @@ class KeyboardManager:
             InputState.IDLE: "",
             InputState.RECORDING: "0",
             InputState.RECORDING_TERMINAL: "0",
+            InputState.RECORDING_AGENT: "0",
+            InputState.RECORDING_SMART: "0",
             InputState.RECORDING_TRANSLATE: "0",
             InputState.RECORDING_KIMI: "0",
             InputState.PROCESSING: "1",
+            InputState.PROCESSING_AGENT: "1",
+            InputState.PROCESSING_SMART: "1",
             InputState.PROCESSING_KIMI: "1",
             InputState.TRANSLATING: "1",
             InputState.ERROR: lambda msg: f"{msg}",  # 错误消息使用函数动态生成
@@ -122,23 +169,33 @@ class KeyboardManager:
         
 
         # 获取转录按钮和快捷键修饰键
-        self.transcriptions_button, transcriptions_display = self._resolve_button(
+        (
+            self.transcriptions_button,
+            transcriptions_display,
+            self.transcriptions_button_token,
+        ) = self._resolve_button(
             "TRANSCRIPTIONS_BUTTON",
             "f",
         )
-        self.translations_button, modifier_display = self._resolve_button(
+        (
+            self.translations_button,
+            modifier_display,
+            self.translations_button_token,
+        ) = self._resolve_button(
             "TRANSLATIONS_BUTTON",
             "win",
         )
         transcription_hotkey = os.getenv("TRANSCRIPTION_HOTKEY", "").strip().lower()
         self.single_transcription_hotkey = None
         self.single_transcription_hotkey_display = ""
+        self.single_transcription_hotkey_token = ""
         self.single_transcription_hotkey_mode = os.getenv("TRANSCRIPTION_HOTKEY_MODE", "toggle").strip().lower()
         if transcription_hotkey:
-            self.single_transcription_hotkey, self.single_transcription_hotkey_display = self._resolve_button(
-                "TRANSCRIPTION_HOTKEY",
-                transcription_hotkey,
-            )
+            (
+                self.single_transcription_hotkey,
+                self.single_transcription_hotkey_display,
+                self.single_transcription_hotkey_token,
+            ) = self._resolve_button("TRANSCRIPTION_HOTKEY", transcription_hotkey)
             if self.single_transcription_hotkey_mode not in {"toggle", "hold"}:
                 logger.error(f"无效的 TRANSCRIPTION_HOTKEY_MODE={self.single_transcription_hotkey_mode}，回退到 toggle")
                 self.single_transcription_hotkey_mode = "toggle"
@@ -146,6 +203,7 @@ class KeyboardManager:
         translation_hotkey = os.getenv("TRANSLATION_HOTKEY", "cmd_r").strip().lower()
         self.single_translation_hotkey = None
         self.single_translation_hotkey_display = ""
+        self.single_translation_hotkey_token = ""
         self.single_translation_hotkey_mode = os.getenv(
             "TRANSLATION_HOTKEY_MODE",
             "hold",
@@ -154,6 +212,7 @@ class KeyboardManager:
             (
                 self.single_translation_hotkey,
                 self.single_translation_hotkey_display,
+                self.single_translation_hotkey_token,
             ) = self._resolve_button("TRANSLATION_HOTKEY", translation_hotkey)
             if self.single_translation_hotkey_mode not in {"toggle", "hold"}:
                 logger.error(
@@ -169,16 +228,49 @@ class KeyboardManager:
             logger.error("翻译快捷键与转写快捷键冲突，已禁用翻译快捷键")
             self.single_translation_hotkey = None
 
+        self.dual_input_mode_enabled = (
+            os.getenv("DUAL_INPUT_MODE_ENABLED", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.custom_hotkeys = {
+            "fast": self._resolve_hotkey(
+                "FAST_INPUT_HOTKEY",
+                "alt_r",
+            ),
+            "smart": self._resolve_hotkey(
+                "SMART_INPUT_HOTKEY",
+                "cmd_r",
+            ),
+            "translation": self._resolve_hotkey(
+                "SMART_TRANSLATION_HOTKEY",
+                "cmd_r+e",
+            ),
+            "agent": self._resolve_hotkey(
+                "KNOWLEDGE_AGENT_HOTKEY",
+                "alt_r+a",
+            ),
+        }
+        try:
+            chord_delay_ms = int(os.getenv("HOTKEY_CHORD_DELAY_MS", "180"))
+        except ValueError:
+            chord_delay_ms = 180
+        self.hotkey_chord_delay = max(50, min(chord_delay_ms, 500)) / 1000
+        self._custom_lock = threading.RLock()
+        self._custom_pressed_tokens: set[str] = set()
+        self._custom_pending_timers: dict[str, threading.Timer] = {}
+        self._custom_active_action: str | None = None
         self.terminal_mode_enabled = (
             os.getenv("TERMINAL_MODE_ENABLED", "false").strip().lower()
             in {"1", "true", "yes", "on"}
         )
         self.terminal_mode_key = None
         self.terminal_mode_key_display = ""
+        self.terminal_mode_key_token = ""
         if self.terminal_mode_enabled:
             (
                 self.terminal_mode_key,
                 self.terminal_mode_key_display,
+                self.terminal_mode_key_token,
             ) = self._resolve_button("TERMINAL_MODE_KEY", "m")
             if self.terminal_mode_key in {
                 self.single_transcription_hotkey,
@@ -188,21 +280,53 @@ class KeyboardManager:
                 self.terminal_mode_enabled = False
                 self.terminal_mode_key = None
 
-        if self.single_transcription_hotkey is not None:
+        self.agent_mode_enabled = (
+            os.getenv("KNOWLEDGE_AGENT_ENABLED", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.agent_mode_key = None
+        self.agent_mode_key_display = ""
+        self.agent_mode_key_token = ""
+        if self.agent_mode_enabled:
+            (
+                self.agent_mode_key,
+                self.agent_mode_key_display,
+                self.agent_mode_key_token,
+            ) = self._resolve_button("KNOWLEDGE_AGENT_MODE_KEY", "a")
+            if self.agent_mode_key in {
+                self.single_transcription_hotkey,
+                self.single_translation_hotkey,
+                self.terminal_mode_key,
+            }:
+                logger.error("Agent 模式键与其他快捷键冲突，已禁用 Agent")
+                self.agent_mode_enabled = False
+                self.agent_mode_key = None
+
+        if self.dual_input_mode_enabled:
+            logger.info(
+                "智能快捷键已启用：极速 %s，智能 %s，翻译 %s，Agent %s",
+                self._display_hotkey(self.custom_hotkeys["fast"]),
+                self._display_hotkey(self.custom_hotkeys["smart"]),
+                self._display_hotkey(self.custom_hotkeys["translation"]),
+                self._display_hotkey(self.custom_hotkeys["agent"]),
+            )
+        elif self.single_transcription_hotkey is not None:
             if self.single_transcription_hotkey_mode == "hold":
                 logger.info(f"按住 {self.single_transcription_hotkey_display} 键：开始录音，松开停止并转写")
             else:
                 logger.info(f"按 {self.single_transcription_hotkey_display} 键：切换录音状态（转录模式）")
         else:
             logger.info(f"按 {modifier_display}+{transcriptions_display} 键：切换录音状态（转录模式）")
-        if self.single_translation_hotkey is not None:
+        if not self.dual_input_mode_enabled and self.single_translation_hotkey is not None:
+            mode_name = "翻译"
             action = (
-                "按住说话，松开翻译"
+                f"按住说话，松开{mode_name}"
                 if self.single_translation_hotkey_mode == "hold"
-                else "按一次开始，再按一次结束并翻译"
+                else f"按一次开始，再按一次结束并{mode_name}"
             )
             logger.info(
-                "翻译快捷键 %s：%s",
+                "%s快捷键 %s：%s",
+                "智能" if self.dual_input_mode_enabled else "翻译",
                 self.single_translation_hotkey_display,
                 action,
             )
@@ -210,6 +334,11 @@ class KeyboardManager:
             logger.info(
                 "终端模式已启用：录音期间按 %s 切换本次输入",
                 self.terminal_mode_key_display,
+            )
+        if self.agent_mode_enabled:
+            logger.info(
+                "知识库 Agent 已启用：普通录音期间按 %s 切换本次输入",
+                self.agent_mode_key_display,
             )
         logger.info(f"按 {modifier_display}+I 键：切换录音状态（本地 Whisper 模式）")
         logger.info(f"两种模式都是按一下开始，再按一下结束")
@@ -225,7 +354,52 @@ class KeyboardManager:
             resolved = self._parse_button(button_name)
 
         logger.info(f"配置到快捷键 {env_name}：{button_name}")
-        return resolved, self._display_button_name(button_name)
+        return resolved, self._display_button_name(button_name), button_name
+
+    def _resolve_hotkey(self, env_name: str, default_value: str) -> tuple[str, ...]:
+        configured = os.getenv(env_name, default_value).strip().lower()
+        tokens = self._parse_hotkey(configured)
+        if not tokens:
+            logger.error(
+                "无效的组合快捷键 %s=%s，回退到 %s",
+                env_name,
+                configured,
+                default_value,
+            )
+            tokens = self._parse_hotkey(default_value)
+        logger.info("配置到组合快捷键 %s：%s", env_name, "+".join(tokens))
+        return tokens
+
+    @classmethod
+    def _parse_hotkey(cls, value: str) -> tuple[str, ...]:
+        tokens = tuple(
+            token.strip().lower()
+            for token in (value or "").split("+")
+            if token.strip()
+        )
+        if not tokens or len(set(tokens)) != len(tokens):
+            return ()
+        if any(cls._parse_button(token) is None for token in tokens):
+            return ()
+        return tokens
+
+    @classmethod
+    def _display_hotkey(cls, tokens: tuple[str, ...]) -> str:
+        return "+".join(cls._display_button_name(token) for token in tokens)
+
+    @classmethod
+    def _hotkey_tokens_for_key(
+        cls,
+        key,
+        bindings: dict[str, tuple[str, ...]],
+    ) -> set[str]:
+        tokens = {
+            token
+            for binding in bindings.values()
+            for token in binding
+            if cls._key_matches_token(key, token)
+        }
+        return tokens
 
     @classmethod
     def _parse_button(cls, button_name):
@@ -271,11 +445,32 @@ class KeyboardManager:
             aliases = [getattr(Key, "alt_l", None), getattr(Key, "alt_r", None)]
 
         return any(alias is not None and key == alias for alias in aliases)
+
+    @classmethod
+    def _key_matches_token(
+        cls,
+        key,
+        token: str,
+        configured_key=None,
+    ) -> bool:
+        normalized = (token or "").strip().lower()
+        if normalized in cls.SIDE_SPECIFIC_ALIASES:
+            return key == cls.SIDE_SPECIFIC_ALIASES[normalized]
+        resolved = (
+            configured_key
+            if configured_key is not None
+            else cls._parse_button(normalized)
+        )
+        return resolved is not None and cls._key_matches(key, resolved)
     
     @property
     def state(self):
         """获取当前状态"""
         return self._state
+
+    @property
+    def direct_agent_recording(self) -> bool:
+        return self._direct_agent_recording
     
     @state.setter
     def state(self, new_state):
@@ -291,6 +486,8 @@ class KeyboardManager:
                 # 录音状态
                 self.terminal_mode_active = False
                 self.terminal_mode_key_pressed = False
+                self.agent_mode_active = False
+                self.agent_mode_key_pressed = False
                 self.temp_text_length = 0
                 if self.state_symbol_enabled:
                     self.type_temp_text(message)
@@ -299,6 +496,22 @@ class KeyboardManager:
             elif new_state == InputState.RECORDING_TERMINAL:
                 # 录音已经开始，只切换本次任务的处理模式。
                 self.processing_text = "terminal"
+
+            elif new_state == InputState.RECORDING_AGENT:
+                if self._direct_agent_recording:
+                    self.temp_text_length = 0
+                    if self.state_symbol_enabled:
+                        self.type_temp_text(message)
+                    self.on_agent_start()
+                else:
+                    # 普通录音已经开始，只切换本次任务的处理模式。
+                    self.processing_text = "agent"
+
+            elif new_state == InputState.RECORDING_SMART:
+                self.temp_text_length = 0
+                if self.state_symbol_enabled:
+                    self.type_temp_text(message)
+                self.on_smart_start()
                 
             elif new_state == InputState.RECORDING_TRANSLATE:
                 # 翻译,录音状态
@@ -320,6 +533,20 @@ class KeyboardManager:
                     self.type_temp_text(message)
                 self.processing_text = message
                 self.on_record_stop()
+
+            elif new_state == InputState.PROCESSING_AGENT:
+                self._delete_previous_text()
+                if self.state_symbol_enabled:
+                    self.type_temp_text(message)
+                self.processing_text = message
+                self.on_agent_stop()
+
+            elif new_state == InputState.PROCESSING_SMART:
+                self._delete_previous_text()
+                if self.state_symbol_enabled:
+                    self.type_temp_text(message)
+                self.processing_text = message
+                self.on_smart_stop()
                 
             elif new_state == InputState.PROCESSING_KIMI:
                 # 本地 Whisper 处理状态
@@ -358,6 +585,7 @@ class KeyboardManager:
             elif new_state == InputState.IDLE:
                 # 空闲状态，清除所有临时文本
                 self.processing_text = None
+                self._direct_agent_recording = False
             
             else:
                 # 其他状态
@@ -484,6 +712,31 @@ class KeyboardManager:
         except Exception as e:
             logger.error(f"文本输入失败: {e}")
             self.show_error(f"❌ 文本输入失败: {e}")
+
+    def copy_selected_text(self) -> str:
+        """复制当前应用中的选中文字并返回剪贴板内容。"""
+        previous = pyperclip.paste()
+        pyperclip.copy("")
+        modifier = Key.cmd if self.system_platform == "mac" else Key.ctrl
+        self.keyboard.press(modifier)
+        self.keyboard.press("c")
+        self.keyboard.release("c")
+        self.keyboard.release(modifier)
+        time.sleep(0.12)
+        selected = pyperclip.paste()
+        if not selected:
+            pyperclip.copy(previous)
+        return selected
+
+    def undo_and_type_text(self, text: str) -> None:
+        """撤销目标应用上一次输入，再粘贴指定文字。"""
+        modifier = Key.cmd if self.system_platform == "mac" else Key.ctrl
+        self.keyboard.press(modifier)
+        self.keyboard.press("z")
+        self.keyboard.release("z")
+        self.keyboard.release(modifier)
+        time.sleep(0.12)
+        self._paste_text_from_clipboard(text)
     
     def _delete_previous_text(self):
         """删除之前输入的临时文本"""
@@ -605,6 +858,46 @@ class KeyboardManager:
             self.state = InputState.TRANSLATING
             logger.info("⏹️ 停止录音并开始翻译（按住模式）")
 
+    def toggle_smart_recording(self):
+        """切换智能纠错录音状态。"""
+        current_time = time.time()
+        if current_time - self.last_key_time < self.KEY_DEBOUNCE_TIME:
+            return
+        self.last_key_time = current_time
+        if not self.is_recording:
+            if self.state.can_start_recording:
+                self.is_recording = True
+                self.state = InputState.RECORDING_SMART
+                logger.info("🎤 开始录音（智能纠错模式）")
+        else:
+            self.is_recording = False
+            self.state = InputState.PROCESSING_SMART
+            logger.info("⏹️ 停止录音（智能纠错模式）")
+
+    def start_hold_smart(self):
+        """按住智能键开始录音。"""
+        if self.single_smart_hotkey_pressed:
+            return
+        self.single_smart_hotkey_pressed = True
+        current_time = time.time()
+        if current_time - self.last_key_time < self.KEY_DEBOUNCE_TIME:
+            return
+        self.last_key_time = current_time
+        if not self.is_recording and self.state.can_start_recording:
+            self.is_recording = True
+            self.state = InputState.RECORDING_SMART
+            logger.info("🎤 开始录音（按住智能模式）")
+
+    def stop_hold_smart(self):
+        """松开智能键后停止录音并纠错。"""
+        if not self.single_smart_hotkey_pressed:
+            return
+        self.single_smart_hotkey_pressed = False
+        if self.is_recording:
+            self.is_recording = False
+            self.state = InputState.PROCESSING_SMART
+            logger.info("⏹️ 停止录音并智能纠错（按住模式）")
+
     def start_hold_recording(self):
         """按住式热键：按下开始录音。"""
         if self.single_hotkey_pressed:
@@ -632,6 +925,131 @@ class KeyboardManager:
             self.state = InputState.PROCESSING
             logger.info("⏹️ 停止录音（按住说话模式）")
 
+    def _custom_binding_has_prefix(self, action: str) -> bool:
+        binding = self.custom_hotkeys[action]
+        return any(
+            len(other_binding) > len(binding)
+            and set(binding).issubset(other_binding)
+            for other_binding in self.custom_hotkeys.values()
+        )
+
+    def _cancel_custom_timers(self) -> None:
+        for timer in self._custom_pending_timers.values():
+            timer.cancel()
+        self._custom_pending_timers.clear()
+
+    def _schedule_custom_action(self, action: str) -> None:
+        old_timer = self._custom_pending_timers.pop(action, None)
+        if old_timer is not None:
+            old_timer.cancel()
+
+        def activate() -> None:
+            with self._custom_lock:
+                self._custom_pending_timers.pop(action, None)
+                binding = self.custom_hotkeys[action]
+                if (
+                    self._custom_active_action is not None
+                    or not set(binding).issubset(self._custom_pressed_tokens)
+                ):
+                    return
+                self._start_custom_action(action)
+
+        timer = threading.Timer(self.hotkey_chord_delay, activate)
+        timer.daemon = True
+        self._custom_pending_timers[action] = timer
+        timer.start()
+
+    def _start_custom_action(self, action: str) -> bool:
+        if self._custom_active_action is not None or not self.state.can_start_recording:
+            return False
+        if action == "agent" and not self.agent_mode_enabled:
+            logger.info("Agent 快捷键已触发，但 Agent 总开关未开启")
+            return False
+
+        state_map = {
+            "fast": InputState.RECORDING,
+            "smart": InputState.RECORDING_SMART,
+            "translation": InputState.RECORDING_TRANSLATE,
+            "agent": InputState.RECORDING_AGENT,
+        }
+        self._custom_active_action = action
+        self.is_recording = True
+        self._direct_agent_recording = action == "agent"
+        self.state = state_map[action]
+        logger.info("智能快捷键开始录音：%s", action)
+        return True
+
+    def _stop_custom_action(self, action: str) -> None:
+        if self._custom_active_action != action:
+            return
+        state_map = {
+            "fast": InputState.PROCESSING,
+            "smart": InputState.PROCESSING_SMART,
+            "translation": InputState.TRANSLATING,
+            "agent": InputState.PROCESSING_AGENT,
+        }
+        self._custom_active_action = None
+        self.is_recording = False
+        self.state = state_map[action]
+        if action != "agent":
+            self._direct_agent_recording = False
+        logger.info("智能快捷键停止录音：%s", action)
+
+    def _handle_custom_press(self, key) -> bool:
+        tokens = self._hotkey_tokens_for_key(key, self.custom_hotkeys)
+        if not tokens:
+            return False
+        with self._custom_lock:
+            new_tokens = tokens - self._custom_pressed_tokens
+            self._custom_pressed_tokens.update(tokens)
+            if not new_tokens:
+                return True
+            if self._custom_active_action is not None:
+                return True
+
+            chord_actions = [
+                action
+                for action, binding in self.custom_hotkeys.items()
+                if len(binding) > 1
+                and set(binding).issubset(self._custom_pressed_tokens)
+            ]
+            if chord_actions:
+                chord_actions.sort(
+                    key=lambda action: len(self.custom_hotkeys[action]),
+                    reverse=True,
+                )
+                self._cancel_custom_timers()
+                self._start_custom_action(chord_actions[0])
+                return True
+
+            for action, binding in self.custom_hotkeys.items():
+                if len(binding) != 1 or binding[0] not in new_tokens:
+                    continue
+                if self._custom_binding_has_prefix(action):
+                    self._schedule_custom_action(action)
+                else:
+                    self._start_custom_action(action)
+                break
+        return True
+
+    def _handle_custom_release(self, key) -> bool:
+        tokens = self._hotkey_tokens_for_key(key, self.custom_hotkeys)
+        if not tokens:
+            return False
+        with self._custom_lock:
+            active_action = self._custom_active_action
+            if (
+                active_action is not None
+                and set(tokens).intersection(self.custom_hotkeys[active_action])
+            ):
+                self._stop_custom_action(active_action)
+            self._custom_pressed_tokens.difference_update(tokens)
+            for action, timer in list(self._custom_pending_timers.items()):
+                if set(tokens).intersection(self.custom_hotkeys[action]):
+                    timer.cancel()
+                    self._custom_pending_timers.pop(action, None)
+        return True
+
     def activate_terminal_mode(self) -> bool:
         """将当前普通听写切换为终端模式。"""
         if (
@@ -657,13 +1075,61 @@ class KeyboardManager:
         self.terminal_mode_key_pressed = False
         return active
 
+    def activate_agent_mode(self) -> bool:
+        """将当前普通听写切换为知识库 Agent 指令。"""
+        if (
+            not self.agent_mode_enabled
+            or self.agent_mode_key is None
+            or not self.is_recording
+            or self.state not in {InputState.RECORDING, InputState.RECORDING_AGENT}
+        ):
+            return False
+        if self.agent_mode_active:
+            return True
+        self.agent_mode_active = True
+        self.terminal_mode_active = False
+        self.state = InputState.RECORDING_AGENT
+        logger.info("本次录音已切换为知识库 Agent 模式")
+        return True
+
+    def consume_agent_mode(self) -> bool:
+        """读取并清除本次录音的 Agent 模式标记。"""
+        active = self.agent_mode_active
+        self.agent_mode_active = False
+        self.agent_mode_key_pressed = False
+        return active
+
     def on_press(self, key):
         """按键按下时的回调"""
         try:
+            if self.dual_input_mode_enabled and self._handle_custom_press(key):
+                return
+
+            if (
+                self.agent_mode_enabled
+                and not self.dual_input_mode_enabled
+                and self.agent_mode_key is not None
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "agent_mode_key_token", ""),
+                    self.agent_mode_key,
+                )
+                and self.is_recording
+                and self.state in {InputState.RECORDING, InputState.RECORDING_AGENT}
+            ):
+                if not self.agent_mode_key_pressed:
+                    self.agent_mode_key_pressed = True
+                    self.activate_agent_mode()
+                return
+
             if (
                 self.terminal_mode_enabled
                 and self.terminal_mode_key is not None
-                and self._key_matches(key, self.terminal_mode_key)
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "terminal_mode_key_token", ""),
+                    self.terminal_mode_key,
+                )
                 and self.is_recording
                 and self.state
                 in {InputState.RECORDING, InputState.RECORDING_TERMINAL}
@@ -675,7 +1141,11 @@ class KeyboardManager:
 
             if (
                 self.single_translation_hotkey is not None
-                and self._key_matches(key, self.single_translation_hotkey)
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "single_translation_hotkey_token", ""),
+                    self.single_translation_hotkey,
+                )
             ):
                 if self.single_translation_hotkey_mode == "hold":
                     self.start_hold_translation()
@@ -685,7 +1155,11 @@ class KeyboardManager:
 
             if (
                 self.single_transcription_hotkey is not None
-                and self._key_matches(key, self.single_transcription_hotkey)
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "single_transcription_hotkey_token", ""),
+                    self.single_transcription_hotkey,
+                )
             ):
                 if self.single_transcription_hotkey_mode == "hold":
                     self.start_hold_recording()
@@ -694,10 +1168,18 @@ class KeyboardManager:
                 return
 
             # 检查转录按钮（字符键或特殊键）
-            is_transcription_key = self._key_matches(key, self.transcriptions_button)
+            is_transcription_key = self._key_matches_token(
+                key,
+                getattr(self, "transcriptions_button_token", ""),
+                self.transcriptions_button,
+            )
                 
             # 检查快捷键修饰键（如 Win/Ctrl/Cmd）
-            is_translation_key = self._key_matches(key, self.translations_button)
+            is_translation_key = self._key_matches_token(
+                key,
+                getattr(self, "translations_button_token", ""),
+                self.translations_button,
+            )
             
             # 检查I键（用于本地 Whisper 模式）
             if hasattr(key, 'char') and key.char == 'i':
@@ -724,17 +1206,41 @@ class KeyboardManager:
     def on_release(self, key):
         """按键释放时的回调"""
         try:
+            if self.dual_input_mode_enabled and self._handle_custom_release(key):
+                return
+
+            if (
+                self.agent_mode_enabled
+                and not self.dual_input_mode_enabled
+                and self.agent_mode_key is not None
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "agent_mode_key_token", ""),
+                    self.agent_mode_key,
+                )
+            ):
+                self.agent_mode_key_pressed = False
+                return
+
             if (
                 self.terminal_mode_enabled
                 and self.terminal_mode_key is not None
-                and self._key_matches(key, self.terminal_mode_key)
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "terminal_mode_key_token", ""),
+                    self.terminal_mode_key,
+                )
             ):
                 self.terminal_mode_key_pressed = False
                 return
 
             if (
                 self.single_translation_hotkey is not None
-                and self._key_matches(key, self.single_translation_hotkey)
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "single_translation_hotkey_token", ""),
+                    self.single_translation_hotkey,
+                )
             ):
                 if self.single_translation_hotkey_mode == "hold":
                     self.stop_hold_translation()
@@ -742,17 +1248,29 @@ class KeyboardManager:
 
             if (
                 self.single_transcription_hotkey is not None
-                and self._key_matches(key, self.single_transcription_hotkey)
+                and self._key_matches_token(
+                    key,
+                    getattr(self, "single_transcription_hotkey_token", ""),
+                    self.single_transcription_hotkey,
+                )
             ):
                 if self.single_transcription_hotkey_mode == "hold":
                     self.stop_hold_recording()
                 return
 
             # 检查转录按钮（字符键或特殊键）
-            is_transcription_key = self._key_matches(key, self.transcriptions_button)
+            is_transcription_key = self._key_matches_token(
+                key,
+                getattr(self, "transcriptions_button_token", ""),
+                self.transcriptions_button,
+            )
                 
             # 检查快捷键修饰键（如 Win/Ctrl/Cmd）
-            is_translation_key = self._key_matches(key, self.translations_button)
+            is_translation_key = self._key_matches_token(
+                key,
+                getattr(self, "translations_button_token", ""),
+                self.translations_button,
+            )
                 
             # 检查I键释放
             if hasattr(key, 'char') and key.char == 'i':
@@ -781,8 +1299,16 @@ class KeyboardManager:
         self.i_pressed = False
         self.single_hotkey_pressed = False
         self.single_translation_hotkey_pressed = False
+        self.single_smart_hotkey_pressed = False
         self.terminal_mode_key_pressed = False
         self.terminal_mode_active = False
+        self.agent_mode_key_pressed = False
+        self.agent_mode_active = False
+        with self._custom_lock:
+            self._cancel_custom_timers()
+            self._custom_pressed_tokens.clear()
+            self._custom_active_action = None
+        self._direct_agent_recording = False
         self.is_recording = False
         self.last_key_time = time.time()
         self.processing_text = None

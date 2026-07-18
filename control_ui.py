@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 
 import sounddevice as sd
-from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QDesktopServices, QFont, QIcon
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -36,10 +37,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from src.agent import GlossarySuggestion, KnowledgeAgent
 from src.control import EnvStore, ServiceManager
 from src.correction import CORRECTION_LEVEL_LABELS
 from src.glossary import GlossaryEntry, GlossaryProcessor, GlossaryStore
 from src.history import HistoryStore, TranscriptionRecord
+from src.keyboard.listener import KeyboardManager
 from src.llm.translate import TARGET_LANGUAGE_LABELS
 from src.memory import PersonalMemoryStore
 from src.persona import PersonaEntry, PersonaProcessor, PersonaStore
@@ -116,15 +119,74 @@ TRANSLATION_LANGUAGES = [
 ]
 
 HOTKEY_LABELS = {
+    "alt": "Alt",
+    "alt_l": "左 Alt",
     "alt_r": "右 Alt",
+    "alt_gr": "AltGr",
+    "option": "Option",
+    "option_l": "左 Option",
     "option_r": "右 Alt",
+    "left_option": "左 Option",
     "right_option": "右 Alt",
+    "ctrl": "Ctrl",
+    "control": "Ctrl",
+    "ctrl_l": "左 Ctrl",
+    "control_l": "左 Ctrl",
     "ctrl_r": "右 Ctrl",
     "control_r": "右 Ctrl",
+    "shift": "Shift",
+    "shift_l": "左 Shift",
     "shift_r": "右 Shift",
+    "cmd": "Command",
+    "command": "Command",
+    "cmd_l": "左 Command",
+    "command_l": "左 Command",
+    "left_command": "左 Command",
     "cmd_r": "右 Command",
     "command_r": "右 Command",
     "right_command": "右 Command",
+    "win": "Win",
+    "windows": "Win",
+    "super": "Win",
+    "space": "空格",
+    "tab": "Tab",
+    "enter": "回车",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "page_up": "Page Up",
+    "page_down": "Page Down",
+}
+
+HOTKEY_PHYSICAL_TOKENS = {
+    "ctrl": ("ctrl_l", "ctrl_r"),
+    "control": ("ctrl_l", "ctrl_r"),
+    "ctrl_l": ("ctrl_l",),
+    "control_l": ("ctrl_l",),
+    "ctrl_r": ("ctrl_r",),
+    "control_r": ("ctrl_r",),
+    "alt": ("alt_l", "alt_r"),
+    "option": ("alt_l", "alt_r"),
+    "alt_l": ("alt_l",),
+    "option_l": ("alt_l",),
+    "left_option": ("alt_l",),
+    "alt_r": ("alt_r",),
+    "option_r": ("alt_r",),
+    "right_option": ("alt_r",),
+    "cmd": ("cmd_l", "cmd_r"),
+    "command": ("cmd_l", "cmd_r"),
+    "win": ("cmd_l", "cmd_r"),
+    "windows": ("cmd_l", "cmd_r"),
+    "super": ("cmd_l", "cmd_r"),
+    "cmd_l": ("cmd_l",),
+    "command_l": ("cmd_l",),
+    "left_command": ("cmd_l",),
+    "cmd_r": ("cmd_r",),
+    "command_r": ("cmd_r",),
+    "right_command": ("cmd_r",),
+    "shift": ("shift_l", "shift_r"),
+    "shift_l": ("shift_l",),
+    "shift_r": ("shift_r",),
 }
 
 
@@ -152,7 +214,12 @@ def set_combo_data(combo: QComboBox, value: str) -> None:
 
 def format_hotkey(value: str) -> str:
     normalized = (value or "").strip().lower()
-    return HOTKEY_LABELS.get(normalized, value or "未配置")
+    if not normalized:
+        return "未配置"
+    return "+".join(
+        HOTKEY_LABELS.get(token, token.upper() if len(token) == 1 else token)
+        for token in normalized.split("+")
+    )
 
 
 def service_display(value: str) -> str:
@@ -204,6 +271,200 @@ class MetricCard(QFrame):
         self.value_label.setText(value)
 
 
+class HotkeyCaptureEdit(QLineEdit):
+    hotkeyChanged = pyqtSignal(str)
+    captureStarted = pyqtSignal()
+    captureFinished = pyqtSignal()
+
+    _X11_NATIVE_TOKENS = {
+        37: "ctrl_l",
+        50: "shift_l",
+        62: "shift_r",
+        64: "alt_l",
+        105: "ctrl_r",
+        108: "alt_r",
+        133: "cmd_l",
+        134: "cmd_r",
+    }
+    _WAYLAND_NATIVE_TOKENS = {
+        29: "ctrl_l",
+        42: "shift_l",
+        54: "shift_r",
+        56: "alt_l",
+        97: "ctrl_r",
+        100: "alt_r",
+        125: "cmd_l",
+        126: "cmd_r",
+    }
+    _MODIFIER_TOKENS = {
+        Qt.Key_Control: "ctrl",
+        Qt.Key_Shift: "shift",
+        Qt.Key_Alt: "alt",
+        Qt.Key_AltGr: "alt_gr",
+        Qt.Key_Meta: "cmd",
+        Qt.Key_Super_L: "cmd_l",
+        Qt.Key_Super_R: "cmd_r",
+    }
+    _SPECIAL_TOKENS = {
+        Qt.Key_Space: "space",
+        Qt.Key_Tab: "tab",
+        Qt.Key_Return: "enter",
+        Qt.Key_Enter: "enter",
+        Qt.Key_Insert: "insert",
+        Qt.Key_Home: "home",
+        Qt.Key_End: "end",
+        Qt.Key_PageUp: "page_up",
+        Qt.Key_PageDown: "page_down",
+    }
+
+    def __init__(self, placeholder: str = "") -> None:
+        super().__init__()
+        self._hotkey = ""
+        self._capturing = False
+        self._original_hotkey = ""
+        self._capture_tokens: list[str] = []
+        self._pressed_keys: set[tuple[int, int]] = set()
+        self.setReadOnly(True)
+        self.setClearButtonEnabled(False)
+        self.setPlaceholderText(placeholder or "点击后直接按下快捷键")
+        self.setToolTip("点击输入框，然后按下并松开要使用的单键或组合键。Esc 取消。")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("hotkeyCapture")
+        self.setMaximumWidth(320)
+
+    def hotkey(self) -> str:
+        return self._hotkey
+
+    def set_hotkey(self, value: str) -> None:
+        normalized = (value or "").strip().lower()
+        parsed = KeyboardManager._parse_hotkey(normalized)
+        self._hotkey = "+".join(parsed) if parsed else normalized
+        super().setText(format_hotkey(self._hotkey) if self._hotkey else "")
+        self.hotkeyChanged.emit(self._hotkey)
+
+    def setText(self, value: str) -> None:
+        self.set_hotkey(value)
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        if not self._capturing:
+            self._capturing = True
+            self._original_hotkey = self._hotkey
+            self._capture_tokens = []
+            self._pressed_keys = set()
+            self.setProperty("capturing", True)
+            repolish(self)
+            super().setText("正在录入...")
+            self.captureStarted.emit()
+
+    def focusOutEvent(self, event) -> None:
+        if self._capturing:
+            self._finish_capture(cancel=not self._capture_tokens)
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape:
+            self._finish_capture(cancel=True)
+            self.clearFocus()
+            event.accept()
+            return
+        if event.key() in {Qt.Key_Backspace, Qt.Key_Delete}:
+            self._capture_tokens = []
+            self._hotkey = ""
+            self._finish_capture(cancel=False)
+            self.clearFocus()
+            event.accept()
+            return
+
+        token = self._event_token(event)
+        if token:
+            identity = (int(event.nativeScanCode()), int(event.key()))
+            self._pressed_keys.add(identity)
+            if token not in self._capture_tokens:
+                self._capture_tokens.append(token)
+            super().setText(
+                "按键中：" + format_hotkey("+".join(self._ordered_tokens()))
+            )
+        event.accept()
+
+    def keyReleaseEvent(self, event) -> None:
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        identity = (int(event.nativeScanCode()), int(event.key()))
+        self._pressed_keys.discard(identity)
+        if self._capturing and self._capture_tokens and not self._pressed_keys:
+            self._finish_capture(cancel=False)
+            self.clearFocus()
+        event.accept()
+
+    def _finish_capture(self, *, cancel: bool) -> None:
+        if not self._capturing:
+            return
+        self._capturing = False
+        if cancel:
+            self._hotkey = self._original_hotkey
+        elif self._capture_tokens:
+            self._hotkey = "+".join(self._ordered_tokens())
+        super().setText(format_hotkey(self._hotkey) if self._hotkey else "")
+        self.setProperty("capturing", False)
+        repolish(self)
+        self.hotkeyChanged.emit(self._hotkey)
+        self.captureFinished.emit()
+
+    def _ordered_tokens(self) -> list[str]:
+        modifier_order = {
+            "ctrl": 0,
+            "ctrl_l": 0,
+            "ctrl_r": 0,
+            "alt": 1,
+            "alt_l": 1,
+            "alt_r": 1,
+            "alt_gr": 1,
+            "cmd": 2,
+            "cmd_l": 2,
+            "cmd_r": 2,
+            "shift": 3,
+            "shift_l": 3,
+            "shift_r": 3,
+        }
+        return sorted(
+            self._capture_tokens,
+            key=lambda token: (
+                modifier_order.get(token, 10),
+                self._capture_tokens.index(token),
+            ),
+        )
+
+    @classmethod
+    def _event_token(cls, event) -> str:
+        native_scan_code = int(event.nativeScanCode())
+        platform_name = QApplication.platformName().lower()
+        if "xcb" in platform_name and native_scan_code in cls._X11_NATIVE_TOKENS:
+            return cls._X11_NATIVE_TOKENS[native_scan_code]
+        if (
+            "wayland" in platform_name
+            and native_scan_code in cls._WAYLAND_NATIVE_TOKENS
+        ):
+            return cls._WAYLAND_NATIVE_TOKENS[native_scan_code]
+        key = int(event.key())
+        if key in cls._MODIFIER_TOKENS:
+            return cls._MODIFIER_TOKENS[key]
+        if key in cls._SPECIAL_TOKENS:
+            return cls._SPECIAL_TOKENS[key]
+        if Qt.Key_F1 <= key <= Qt.Key_F35:
+            return f"f{key - Qt.Key_F1 + 1}"
+        if Qt.Key_A <= key <= Qt.Key_Z:
+            return chr(ord("a") + key - Qt.Key_A)
+        if Qt.Key_0 <= key <= Qt.Key_9:
+            return chr(ord("0") + key - Qt.Key_0)
+        text = (event.text() or "").strip().lower()
+        return text if len(text) == 1 else ""
+
+
 class ControlUI(QMainWindow):
     HISTORY_PAGE_SIZE = 100
 
@@ -211,10 +472,12 @@ class ControlUI(QMainWindow):
         "概览",
         "历史记录",
         "识别引擎",
-        "快捷键与翻译",
+        "快捷键",
+        "翻译",
         "粘贴与文本",
         "词库与纠错",
         "个人资料库",
+        "智能与 Agent",
         "人设与改写",
         "诊断",
     ]
@@ -247,16 +510,25 @@ class ControlUI(QMainWindow):
         self.glossary = GlossaryStore(self.root / "data" / "glossary.db")
         self.glossary_processor = GlossaryProcessor(self.glossary)
         self.memory_store = PersonalMemoryStore(self.root / "data" / "memory")
+        self.knowledge_agent = KnowledgeAgent(
+            self.history,
+            self.glossary,
+            self.memory_store,
+            root=self.root / "data" / "agent",
+        )
         self.personas = PersonaStore(self.root / "data" / "personas.db")
         self._history_rows: list[TranscriptionRecord] = []
         self._history_page = 0
         self._glossary_rows: list[GlossaryEntry] = []
         self._persona_rows: list[PersonaEntry] = []
+        self._agent_suggestions: list[GlossarySuggestion] = []
         self._editing_glossary_id: int | None = None
         self._editing_persona_id: int | None = None
         self._glossary_updating = False
         self._persona_updating = False
         self._running = False
+        self._hotkey_capture_depth = 0
+        self._hotkey_capture_service_was_running = False
 
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1080, 720)
@@ -330,9 +602,11 @@ class ControlUI(QMainWindow):
         self.stack.addWidget(self._build_history_page())
         self.stack.addWidget(self._build_engines_page())
         self.stack.addWidget(self._build_behavior_page())
+        self.stack.addWidget(self._build_translation_page())
         self.stack.addWidget(self._build_paste_text_page())
         self.stack.addWidget(self._build_glossary_page())
         self.stack.addWidget(self._build_memory_page())
+        self.stack.addWidget(self._build_smart_agent_page())
         self.stack.addWidget(self._build_persona_page())
         self.stack.addWidget(self._build_diagnostics_page())
         content_layout.addWidget(self.stack, stretch=1)
@@ -606,10 +880,6 @@ class ControlUI(QMainWindow):
         self.model_input.setPlaceholderText("qwen3-asr-flash")
         cloud_form.addRow("阿里云模型", self.model_input)
 
-        self.translation_model_input = QLineEdit()
-        self.translation_model_input.setPlaceholderText("qwen-mt-flash")
-        cloud_form.addRow("翻译模型", self.translation_model_input)
-
         self.dashscope_key_input = self._password_input("DashScope API Key")
         cloud_form.addRow("DashScope Key", self.dashscope_key_input)
 
@@ -647,60 +917,38 @@ class ControlUI(QMainWindow):
         return page
 
     def _build_behavior_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
+        page = QScrollArea()
+        page.setObjectName("shortcutScroll")
+        page.setWidgetResizable(True)
+        page.setFrameShape(QFrame.NoFrame)
+        page.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content.setObjectName("shortcutContent")
+        content.setMinimumHeight(850)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
         hotkey_panel = self._section_panel(
-            "听写快捷键",
-            "控制普通语音听写的触发方式、录音保存和失败重试。",
+            "兼容快捷键",
+            "智能快捷键关闭时继续使用这一组配置，原来的操作习惯保持不变。",
         )
         form = QFormLayout()
         form.setHorizontalSpacing(22)
         form.setVerticalSpacing(12)
 
-        self.hotkey_input = QLineEdit()
-        self.hotkey_input.setPlaceholderText("alt_r")
-        self.hotkey_input.setMaximumWidth(280)
+        self.hotkey_input = self._hotkey_capture_input("alt_r")
         form.addRow("触发按键", self.hotkey_input)
 
         self.hotkey_mode_combo = QComboBox()
         self.hotkey_mode_combo.setMaximumWidth(320)
         self.hotkey_mode_combo.addItem("按住说话，松开转写", "hold")
         self.hotkey_mode_combo.addItem("按一次开始，再按一次结束", "toggle")
-        form.addRow("触发模式", self.hotkey_mode_combo)
+        form.addRow("听写触发模式", self.hotkey_mode_combo)
 
-        self.archive_combo = QComboBox()
-        self.archive_combo.setMaximumWidth(320)
-        self.archive_combo.addItem("不保存录音，仅保存文字历史", "off")
-        self.archive_combo.addItem("保存全部录音和文字", "all")
-        form.addRow("录音归档", self.archive_combo)
-
-        self.retry_spin = QSpinBox()
-        self.retry_spin.setRange(0, 10)
-        self.retry_spin.setSuffix(" 次")
-        form.addRow("失败自动重试", self._spin_control(self.retry_spin, 120))
-        hotkey_panel.layout().addLayout(form)
-        layout.addWidget(hotkey_panel)
-
-        translation_panel = self._section_panel(
-            "实时翻译",
-            "单独设置翻译目标语言和苹果键盘上的翻译触发键。",
-        )
-        translation_form = QFormLayout()
-        translation_form.setHorizontalSpacing(22)
-        translation_form.setVerticalSpacing(12)
-        self.translation_language_combo = QComboBox()
-        self.translation_language_combo.setMaximumWidth(220)
-        for label, value in TRANSLATION_LANGUAGES:
-            self.translation_language_combo.addItem(label, value)
-        translation_form.addRow("目标语言", self.translation_language_combo)
-
-        self.translation_hotkey_input = QLineEdit()
-        self.translation_hotkey_input.setPlaceholderText("cmd_r")
-        self.translation_hotkey_input.setMaximumWidth(280)
-        translation_form.addRow("翻译快捷键", self.translation_hotkey_input)
+        self.translation_hotkey_input = self._hotkey_capture_input("cmd_r")
+        form.addRow("翻译触发键", self.translation_hotkey_input)
 
         self.translation_hotkey_mode_combo = QComboBox()
         self.translation_hotkey_mode_combo.setMaximumWidth(320)
@@ -709,7 +957,137 @@ class ControlUI(QMainWindow):
             "按一次开始，再按一次结束并翻译",
             "toggle",
         )
-        translation_form.addRow("触发模式", self.translation_hotkey_mode_combo)
+        self.translation_hotkey_mode_combo.currentIndexChanged.connect(
+            self.refresh_shortcut_summaries
+        )
+        form.addRow("翻译触发模式", self.translation_hotkey_mode_combo)
+        hotkey_panel.layout().addLayout(form)
+        layout.addWidget(hotkey_panel)
+
+        smart_panel = self._section_panel(
+            "智能快捷键布局",
+            "开启后使用四组独立按住式快捷键。单键与组合键可以共享修饰键，组合键优先。",
+        )
+        smart_form = QFormLayout()
+        smart_form.setHorizontalSpacing(22)
+        smart_form.setVerticalSpacing(12)
+        self.dual_input_mode_check = QCheckBox("启用自定义智能快捷键")
+        self.dual_input_mode_check.stateChanged.connect(
+            self.refresh_hotkey_conflicts
+        )
+        smart_form.addRow("功能状态", self.dual_input_mode_check)
+
+        self.fast_input_hotkey_input = self._hotkey_capture_input("alt_r")
+        smart_form.addRow("极速输入", self.fast_input_hotkey_input)
+
+        self.smart_input_hotkey_input = self._hotkey_capture_input("cmd_r")
+        smart_form.addRow("智能纠错", self.smart_input_hotkey_input)
+
+        self.smart_translation_hotkey_input = self._hotkey_capture_input("cmd_r+e")
+        smart_form.addRow("语音翻译", self.smart_translation_hotkey_input)
+
+        self.agent_hotkey_input = self._hotkey_capture_input("alt_r+a")
+        smart_form.addRow("Agent 指令", self.agent_hotkey_input)
+
+        self.smart_correction_level_combo = QComboBox()
+        self.smart_correction_level_combo.setMaximumWidth(210)
+        for value, label in CORRECTION_LEVEL_LABELS.items():
+            self.smart_correction_level_combo.addItem(label, value)
+        smart_form.addRow("智能纠错级别", self.smart_correction_level_combo)
+
+        self.hotkey_chord_delay_spin = QSpinBox()
+        self.hotkey_chord_delay_spin.setRange(50, 500)
+        self.hotkey_chord_delay_spin.setSingleStep(10)
+        self.hotkey_chord_delay_spin.setSuffix(" 毫秒")
+        smart_form.addRow(
+            "组合键识别等待",
+            self._spin_control(self.hotkey_chord_delay_spin, 130),
+        )
+        smart_panel.layout().addLayout(smart_form)
+
+        smart_actions = QHBoxLayout()
+        smart_actions.setSpacing(8)
+        reset_hotkeys_button = self._button(
+            "恢复推荐布局",
+            QStyle.SP_DialogResetButton,
+            "secondary",
+        )
+        reset_hotkeys_button.clicked.connect(self.reset_recommended_hotkeys)
+        smart_actions.addWidget(reset_hotkeys_button)
+        smart_actions.addStretch()
+        self.hotkey_conflict_label = QLabel()
+        self.hotkey_conflict_label.setObjectName("hotkeyConflictStatus")
+        self.hotkey_conflict_label.setWordWrap(True)
+        self.hotkey_conflict_label.setMinimumHeight(34)
+        smart_panel.layout().addLayout(smart_actions)
+        smart_panel.layout().addWidget(self.hotkey_conflict_label)
+        layout.addWidget(smart_panel)
+
+        recording_panel = self._section_panel(
+            "录音行为",
+            "这些设置同时作用于极速、智能、翻译和 Agent 录音。",
+        )
+        recording_form = QFormLayout()
+        recording_form.setHorizontalSpacing(22)
+        recording_form.setVerticalSpacing(12)
+        self.archive_combo = QComboBox()
+        self.archive_combo.setMaximumWidth(320)
+        self.archive_combo.addItem("不保存录音，仅保存文字历史", "off")
+        self.archive_combo.addItem("保存全部录音和文字", "all")
+        recording_form.addRow("录音归档", self.archive_combo)
+
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(0, 10)
+        self.retry_spin.setSuffix(" 次")
+        recording_form.addRow(
+            "失败自动重试",
+            self._spin_control(self.retry_spin, 120),
+        )
+        recording_panel.layout().addLayout(recording_form)
+        layout.addWidget(recording_panel)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        save_button = self._button(
+            "保存并重启",
+            QStyle.SP_DialogSaveButton,
+            "primary",
+        )
+        save_button.clicked.connect(self.save_behavior_settings)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+        layout.addStretch()
+        page.setWidget(content)
+        return page
+
+    def _build_translation_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        translation_panel = self._section_panel(
+            "实时翻译",
+            "管理翻译语言和模型。触发按键统一在“快捷键”页面配置。",
+        )
+        translation_form = QFormLayout()
+        translation_form.setHorizontalSpacing(22)
+        translation_form.setVerticalSpacing(12)
+
+        self.translation_language_combo = QComboBox()
+        self.translation_language_combo.setMaximumWidth(220)
+        for label, value in TRANSLATION_LANGUAGES:
+            self.translation_language_combo.addItem(label, value)
+        translation_form.addRow("目标语言", self.translation_language_combo)
+
+        self.translation_model_input = QLineEdit()
+        self.translation_model_input.setPlaceholderText("qwen-mt-flash")
+        self.translation_model_input.setMaximumWidth(320)
+        translation_form.addRow("翻译模型", self.translation_model_input)
+
+        self.translation_shortcut_summary = QLabel()
+        self.translation_shortcut_summary.setObjectName("shortcutSummary")
+        translation_form.addRow("当前触发键", self.translation_shortcut_summary)
         translation_panel.layout().addLayout(translation_form)
         layout.addWidget(translation_panel)
 
@@ -720,7 +1098,7 @@ class ControlUI(QMainWindow):
             QStyle.SP_DialogSaveButton,
             "primary",
         )
-        save_button.clicked.connect(self.save_behavior_settings)
+        save_button.clicked.connect(self.save_translation_settings)
         actions.addWidget(save_button)
         layout.addLayout(actions)
         layout.addStretch()
@@ -1250,6 +1628,124 @@ class ControlUI(QMainWindow):
         page.setWidget(content)
         return page
 
+    def _build_smart_agent_page(self) -> QWidget:
+        page = QScrollArea()
+        page.setObjectName("smartAgentScroll")
+        page.setWidgetResizable(True)
+        page.setFrameShape(QFrame.NoFrame)
+        page.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content.setObjectName("smartAgentContent")
+        content.setMinimumHeight(760)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(14)
+
+        context_panel = self._section_panel(
+            "上下文与编辑",
+            "以下能力互相独立。只开启你需要的项目，关闭后不会改变普通听写。",
+        )
+        context_form = QFormLayout()
+        context_form.setHorizontalSpacing(28)
+        context_form.setVerticalSpacing(13)
+        self.correction_undo_check = QCheckBox("允许语音说“撤销上次纠错”")
+        self.voice_edit_commands_check = QCheckBox("识别换行、分段、引号和括号口令")
+        self.app_profile_check = QCheckBox("根据当前应用自动使用终端文本格式")
+        self.selected_text_ai_check = QCheckBox("允许语音修改当前选中文字")
+        context_form.addRow("纠错撤销", self.correction_undo_check)
+        context_form.addRow("语音编辑", self.voice_edit_commands_check)
+        context_form.addRow("应用感知", self.app_profile_check)
+        context_form.addRow("选中文字 AI", self.selected_text_ai_check)
+        context_panel.layout().addLayout(context_form)
+        layout.addWidget(context_panel)
+
+        agent_panel = self._section_panel(
+            "知识库 Agent",
+            "通过“快捷键”页面配置的 Agent 组合键按需运行；可整理历史、管理词库、记录知识并打开白名单应用。",
+        )
+        agent_form = QFormLayout()
+        agent_form.setHorizontalSpacing(28)
+        agent_form.setVerticalSpacing(12)
+        self.knowledge_agent_enabled_check = QCheckBox("启用知识库 Agent")
+        self.knowledge_agent_enabled_check.stateChanged.connect(
+            self.refresh_shortcut_summaries
+        )
+        agent_form.addRow("Agent 总开关", self.knowledge_agent_enabled_check)
+        self.agent_shortcut_summary = QLabel()
+        self.agent_shortcut_summary.setObjectName("shortcutSummary")
+        agent_form.addRow("当前触发键", self.agent_shortcut_summary)
+        self.glossary_learning_check = QCheckBox("允许 Agent 将高置信候选加入词库")
+        agent_form.addRow("词库学习", self.glossary_learning_check)
+        self.agent_automation_combo = QComboBox()
+        self.agent_automation_combo.setMaximumWidth(250)
+        self.agent_automation_combo.addItem("只生成建议", "suggest")
+        self.agent_automation_combo.addItem("半自动：仅高置信", "semi")
+        self.agent_automation_combo.addItem("自动应用全部候选", "auto")
+        agent_form.addRow("整理方式", self.agent_automation_combo)
+        self.agent_history_days_spin = QSpinBox()
+        self.agent_history_days_spin.setRange(0, 365)
+        self.agent_history_days_spin.setSuffix(" 天")
+        self.agent_history_days_spin.setSpecialValueText("全部历史")
+        agent_form.addRow(
+            "扫描范围",
+            self._spin_control(self.agent_history_days_spin, 130),
+        )
+        agent_panel.layout().addLayout(agent_form)
+
+        agent_toolbar = QHBoxLayout()
+        agent_toolbar.setSpacing(8)
+        scan_button = self._button(
+            "扫描历史",
+            QStyle.SP_BrowserReload,
+            "secondary",
+        )
+        scan_button.clicked.connect(self.scan_agent_history)
+        agent_toolbar.addWidget(scan_button)
+        apply_button = self._button(
+            "应用选中建议",
+            QStyle.SP_DialogApplyButton,
+            "secondary",
+        )
+        apply_button.clicked.connect(self.apply_agent_suggestions)
+        agent_toolbar.addWidget(apply_button)
+        agent_toolbar.addStretch()
+        self.agent_status_label = QLabel("尚未扫描历史记录。")
+        self.agent_status_label.setObjectName("pageHint")
+        agent_toolbar.addWidget(self.agent_status_label)
+        agent_panel.layout().addLayout(agent_toolbar)
+
+        self.agent_suggestions_table = self._table(
+            ["采用", "口述形式", "标准写法", "次数", "置信度", "依据"]
+        )
+        self.agent_suggestions_table.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+        )
+        self.agent_suggestions_table.setMaximumHeight(235)
+        agent_header = self.agent_suggestions_table.horizontalHeader()
+        agent_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        agent_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        agent_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        agent_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        agent_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        agent_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        agent_panel.layout().addWidget(self.agent_suggestions_table)
+        layout.addWidget(agent_panel)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        save_button = self._button(
+            "保存并重启",
+            QStyle.SP_DialogSaveButton,
+            "primary",
+        )
+        save_button.clicked.connect(self.save_smart_agent_settings)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+        layout.addStretch()
+        page.setWidget(content)
+        return page
+
     def _build_diagnostics_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1314,6 +1810,191 @@ class ControlUI(QMainWindow):
         self.log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
         layout.addWidget(self.log_view, stretch=1)
         return page
+
+    def _hotkey_capture_input(self, placeholder: str) -> HotkeyCaptureEdit:
+        field = HotkeyCaptureEdit(placeholder)
+        field.captureStarted.connect(self._begin_hotkey_capture)
+        field.captureFinished.connect(self._end_hotkey_capture)
+        field.hotkeyChanged.connect(self.refresh_hotkey_conflicts)
+        return field
+
+    def _begin_hotkey_capture(self) -> None:
+        if self._hotkey_capture_depth == 0:
+            self._hotkey_capture_service_was_running = self.service.is_running()
+            if self._hotkey_capture_service_was_running:
+                success, _message = self.service.stop()
+                if not success:
+                    self._hotkey_capture_service_was_running = False
+        self._hotkey_capture_depth += 1
+        if hasattr(self, "hotkey_conflict_label"):
+            self.hotkey_conflict_label.setText("按键录入中，语音服务已暂停")
+            self.hotkey_conflict_label.setProperty("state", "capture")
+            repolish(self.hotkey_conflict_label)
+
+    def _end_hotkey_capture(self) -> None:
+        self._hotkey_capture_depth = max(0, self._hotkey_capture_depth - 1)
+        if (
+            self._hotkey_capture_depth == 0
+            and self._hotkey_capture_service_was_running
+        ):
+            self.service.start()
+            self._hotkey_capture_service_was_running = False
+        self.refresh_hotkey_conflicts()
+        self.refresh_status()
+
+    def _hotkey_values(self) -> dict[str, str]:
+        return {
+            "兼容听写": self.hotkey_input.hotkey(),
+            "兼容翻译": self.translation_hotkey_input.hotkey(),
+            "极速输入": self.fast_input_hotkey_input.hotkey(),
+            "智能纠错": self.smart_input_hotkey_input.hotkey(),
+            "语音翻译": self.smart_translation_hotkey_input.hotkey(),
+            "Agent 指令": self.agent_hotkey_input.hotkey(),
+        }
+
+    @staticmethod
+    def _physical_hotkey_variants(
+        tokens: tuple[str, ...],
+    ) -> tuple[set[frozenset[str]], bool]:
+        choices = [
+            HOTKEY_PHYSICAL_TOKENS.get(token, (token,))
+            for token in tokens
+        ]
+        for index, left in enumerate(choices):
+            for right in choices[index + 1 :]:
+                if set(left).intersection(right):
+                    return set(), True
+        variants = {
+            frozenset(binding)
+            for binding in product(*choices)
+            if len(set(binding)) == len(tokens)
+        }
+        return variants, False
+
+    def refresh_hotkey_conflicts(self, *_args: object) -> bool:
+        if not hasattr(self, "hotkey_conflict_label"):
+            return True
+        values = self._hotkey_values()
+        parsed: dict[str, tuple[str, ...]] = {}
+        physical_variants: dict[str, set[frozenset[str]]] = {}
+        invalid: list[str] = []
+        ambiguous: list[str] = []
+        for label, value in values.items():
+            tokens = KeyboardManager._parse_hotkey(value)
+            if not tokens:
+                invalid.append(label)
+            else:
+                parsed[label] = tokens
+                variants, overlaps_itself = self._physical_hotkey_variants(tokens)
+                if overlaps_itself:
+                    ambiguous.append(label)
+                else:
+                    physical_variants[label] = variants
+
+        conflicts: list[str] = []
+        groups = (
+            ("兼容", ("兼容听写", "兼容翻译")),
+            (
+                "智能",
+                ("极速输入", "智能纠错", "语音翻译", "Agent 指令"),
+            ),
+        )
+        for _group_name, labels in groups:
+            for index, left_label in enumerate(labels):
+                for right_label in labels[index + 1 :]:
+                    if (
+                        left_label not in parsed
+                        or right_label not in parsed
+                        or len(parsed[left_label]) != len(parsed[right_label])
+                    ):
+                        continue
+                    if physical_variants.get(left_label, set()).intersection(
+                        physical_variants.get(right_label, set())
+                    ):
+                        conflicts.append(f"{left_label}、{right_label}")
+
+        if invalid:
+            message = "未配置：" + "、".join(invalid)
+            state = "bad"
+            valid = False
+        elif ambiguous:
+            message = "组合内含重复修饰键：" + "、".join(ambiguous)
+            state = "bad"
+            valid = False
+        elif conflicts:
+            message = "按键冲突：" + "；".join(conflicts)
+            state = "bad"
+            valid = False
+        else:
+            active_group = (
+                "智能快捷键"
+                if self.dual_input_mode_check.isChecked()
+                else "兼容快捷键"
+            )
+            message = f"当前生效：{active_group}，全部配置无冲突"
+            state = "good"
+            valid = True
+
+        self.hotkey_conflict_label.setText(message)
+        self.hotkey_conflict_label.setProperty("state", state)
+        repolish(self.hotkey_conflict_label)
+        self.refresh_shortcut_summaries()
+        return valid
+
+    def reset_recommended_hotkeys(self) -> None:
+        recommended = {
+            self.hotkey_input: "alt_r",
+            self.translation_hotkey_input: "cmd_r",
+            self.fast_input_hotkey_input: "alt_r",
+            self.smart_input_hotkey_input: "cmd_r",
+            self.smart_translation_hotkey_input: "cmd_r+e",
+            self.agent_hotkey_input: "alt_r+a",
+        }
+        for field, value in recommended.items():
+            field.set_hotkey(value)
+        self.hotkey_chord_delay_spin.setValue(180)
+        self.refresh_hotkey_conflicts()
+
+    def refresh_shortcut_summaries(self) -> None:
+        required = (
+            "translation_shortcut_summary",
+            "agent_shortcut_summary",
+            "dual_input_mode_check",
+            "translation_hotkey_input",
+            "smart_translation_hotkey_input",
+            "agent_hotkey_input",
+        )
+        if not all(hasattr(self, name) for name in required):
+            return
+        smart_enabled = self.dual_input_mode_check.isChecked()
+        translation_hotkey = (
+            self.smart_translation_hotkey_input.hotkey()
+            if smart_enabled
+            else self.translation_hotkey_input.hotkey()
+        )
+        translation_mode = (
+            "按住说话"
+            if smart_enabled
+            or self.translation_hotkey_mode_combo.currentData() == "hold"
+            else "按键切换"
+        )
+        self.translation_shortcut_summary.setText(
+            f"{format_hotkey(translation_hotkey)} · {translation_mode}"
+        )
+        agent_enabled = (
+            hasattr(self, "knowledge_agent_enabled_check")
+            and self.knowledge_agent_enabled_check.isChecked()
+        )
+        self.agent_shortcut_summary.setText(
+            (
+                (
+                    f"{format_hotkey(self.agent_hotkey_input.hotkey())} · "
+                    f"{'可用' if agent_enabled else 'Agent 总开关关闭'}"
+                )
+                if smart_enabled
+                else "智能快捷键未开启"
+            )
+        )
 
     def _section_panel(self, title: str, detail: str) -> QFrame:
         panel = QFrame()
@@ -1628,6 +2309,49 @@ class ControlUI(QMainWindow):
                 border: 1px solid #2b8b58;
                 background: #ffffff;
             }
+            QLineEdit#hotkeyCapture {
+                color: #1d5e3b;
+                background: #f7faf8;
+                font-weight: 700;
+            }
+            QLineEdit#hotkeyCapture[capturing="true"] {
+                color: #7c520d;
+                background: #fff8e8;
+                border: 1px solid #d7a84d;
+            }
+            QLabel#hotkeyConflictStatus {
+                color: #5e6961;
+                background: #f4f6f4;
+                border: 1px solid #dce2dd;
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QLabel#hotkeyConflictStatus[state="good"] {
+                color: #1e6942;
+                background: #edf8f1;
+                border-color: #c3e2cf;
+            }
+            QLabel#hotkeyConflictStatus[state="bad"] {
+                color: #9b3733;
+                background: #fff3f1;
+                border-color: #e7c7c4;
+            }
+            QLabel#hotkeyConflictStatus[state="capture"] {
+                color: #7c520d;
+                background: #fff8e8;
+                border-color: #e5cc94;
+            }
+            QLabel#shortcutSummary {
+                color: #1d5e3b;
+                background: #edf7f0;
+                border: 1px solid #cce3d4;
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }
             QToolButton#spinStepButton {
                 background: #ffffff;
                 border: 1px solid #c6d0c8;
@@ -1749,19 +2473,25 @@ class ControlUI(QMainWindow):
         self.page_title.setText(self.PAGE_TITLES[index])
         if index == 1:
             self.refresh_history()
-        elif index == 5:
-            self.refresh_glossary()
         elif index == 6:
-            self.refresh_personas()
+            self.refresh_glossary()
         elif index == 7:
+            self.refresh_memory_summary()
+        elif index == 8:
+            self.refresh_agent_suggestions()
+        elif index == 9:
+            self.refresh_personas()
+        elif index == 10:
             self.refresh_diagnostics()
 
     def refresh_all(self) -> None:
         self.refresh_status()
+        self.refresh_hotkey_conflicts()
         self.refresh_metrics()
         self.refresh_history()
         self.refresh_recent_history()
         self.refresh_glossary()
+        self.refresh_agent_suggestions()
         self.refresh_personas()
         self.refresh_diagnostics()
         self.refresh_logs()
@@ -1769,7 +2499,7 @@ class ControlUI(QMainWindow):
     def refresh_passive_data(self) -> None:
         self.refresh_metrics()
         self.refresh_recent_history()
-        if self.stack.currentIndex() == 7:
+        if self.stack.currentIndex() == 10:
             self.refresh_logs()
 
     def refresh_status(self) -> None:
@@ -1787,6 +2517,28 @@ class ControlUI(QMainWindow):
         translation_mode_label = (
             "按住翻译" if translation_mode == "hold" else "按键切换"
         )
+        smart_hotkeys_enabled = self.env_store.get_bool(
+            env,
+            "DUAL_INPUT_MODE_ENABLED",
+            False,
+        )
+        fast_hotkey_label = format_hotkey(
+            env.get("FAST_INPUT_HOTKEY", "alt_r")
+        )
+        smart_hotkey_label = format_hotkey(
+            env.get("SMART_INPUT_HOTKEY", "cmd_r")
+        )
+        smart_translation_label = format_hotkey(
+            env.get("SMART_TRANSLATION_HOTKEY", "cmd_r+e")
+        )
+        agent_hotkey_label = format_hotkey(
+            env.get("KNOWLEDGE_AGENT_HOTKEY", "alt_r+a")
+        )
+        if smart_hotkeys_enabled:
+            hotkey_label = f"极速 {fast_hotkey_label} / 智能 {smart_hotkey_label}"
+            mode_label = "按住说话"
+            translation_hotkey_label = smart_translation_label
+            translation_mode_label = "按住翻译"
         target_language = env.get("TRANSLATION_TARGET_LANGUAGE", "en")
         target_label = TARGET_LANGUAGE_LABELS.get(target_language, target_language)
         persona_enabled = self.env_store.get_bool(
@@ -1818,11 +2570,16 @@ class ControlUI(QMainWindow):
         self.hero_title.setText(
             "语音输入已就绪" if self._running else "语音输入服务未启动"
         )
+        agent_summary = (
+            f"Agent {agent_hotkey_label} · "
+            if smart_hotkeys_enabled
+            else ""
+        )
         self.hero_detail.setText(
             (
                 f"{service_label} · 听写 {hotkey_label} · "
                 f"翻译 {translation_hotkey_label} → {target_label} · "
-                f"人设 {'开启' if persona_enabled else '关闭'}"
+                f"{agent_summary}人设 {'开启' if persona_enabled else '关闭'}"
             )
             if self._running
             else "启动后台服务后，快捷键才会开始监听麦克风。"
@@ -2116,7 +2873,7 @@ class ControlUI(QMainWindow):
             env.get("WHISPER_MODEL_PATH", "models/ggml-large-v3.bin")
         )
 
-        self.hotkey_input.setText(env.get("TRANSCRIPTION_HOTKEY", "alt_r"))
+        self.hotkey_input.set_hotkey(env.get("TRANSCRIPTION_HOTKEY", "alt_r"))
         set_combo_data(
             self.hotkey_mode_combo,
             env.get("TRANSCRIPTION_HOTKEY_MODE", "hold"),
@@ -2135,7 +2892,7 @@ class ControlUI(QMainWindow):
             self.translation_language_combo,
             env.get("TRANSLATION_TARGET_LANGUAGE", "en"),
         )
-        self.translation_hotkey_input.setText(
+        self.translation_hotkey_input.set_hotkey(
             env.get("TRANSLATION_HOTKEY", "cmd_r")
         )
         set_combo_data(
@@ -2202,6 +2959,65 @@ class ControlUI(QMainWindow):
             self.ai_correction_model_combo,
             env.get("AI_CORRECTION_MODEL", "qwen3.5-flash"),
         )
+        self.dual_input_mode_check.setChecked(
+            self.env_store.get_bool(env, "DUAL_INPUT_MODE_ENABLED", False)
+        )
+        self.fast_input_hotkey_input.set_hotkey(
+            env.get("FAST_INPUT_HOTKEY", "alt_r")
+        )
+        self.smart_input_hotkey_input.set_hotkey(
+            env.get("SMART_INPUT_HOTKEY", "cmd_r")
+        )
+        self.smart_translation_hotkey_input.set_hotkey(
+            env.get("SMART_TRANSLATION_HOTKEY", "cmd_r+e")
+        )
+        self.agent_hotkey_input.set_hotkey(
+            env.get("KNOWLEDGE_AGENT_HOTKEY", "alt_r+a")
+        )
+        set_combo_data(
+            self.smart_correction_level_combo,
+            env.get("SMART_INPUT_CORRECTION_LEVEL", "medium"),
+        )
+        self.hotkey_chord_delay_spin.setValue(
+            self.env_store.get_int(
+                env,
+                "HOTKEY_CHORD_DELAY_MS",
+                180,
+                minimum=50,
+                maximum=500,
+            )
+        )
+        self.correction_undo_check.setChecked(
+            self.env_store.get_bool(env, "CORRECTION_UNDO_ENABLED", False)
+        )
+        self.voice_edit_commands_check.setChecked(
+            self.env_store.get_bool(env, "VOICE_EDIT_COMMANDS_ENABLED", False)
+        )
+        self.app_profile_check.setChecked(
+            self.env_store.get_bool(env, "APP_PROFILE_ENABLED", False)
+        )
+        self.selected_text_ai_check.setChecked(
+            self.env_store.get_bool(env, "SELECTED_TEXT_AI_ENABLED", False)
+        )
+        self.glossary_learning_check.setChecked(
+            self.env_store.get_bool(env, "GLOSSARY_LEARNING_ENABLED", False)
+        )
+        self.knowledge_agent_enabled_check.setChecked(
+            self.env_store.get_bool(env, "KNOWLEDGE_AGENT_ENABLED", False)
+        )
+        set_combo_data(
+            self.agent_automation_combo,
+            env.get("KNOWLEDGE_AGENT_AUTOMATION", "semi"),
+        )
+        self.agent_history_days_spin.setValue(
+            self.env_store.get_int(
+                env,
+                "KNOWLEDGE_AGENT_HISTORY_DAYS",
+                7,
+                minimum=0,
+                maximum=365,
+            )
+        )
         self.memory_enabled_check.setChecked(
             self.env_store.get_bool(env, "PERSONAL_MEMORY_ENABLED", True)
         )
@@ -2261,6 +3077,7 @@ class ControlUI(QMainWindow):
                 minimum=0,
             )
         )
+        self.refresh_hotkey_conflicts()
 
     def save_engine_settings(self) -> None:
         default_service = self.default_service_combo.currentData()
@@ -2274,8 +3091,6 @@ class ControlUI(QMainWindow):
                 "BATCH_TRANSCRIPTION_SERVICE": batch_service,
                 "DASHSCOPE_ASR_MODEL": self.model_input.text().strip()
                 or "qwen3-asr-flash",
-                "DASHSCOPE_TRANSLATION_MODEL": self.translation_model_input.text().strip()
-                or "qwen-mt-flash",
                 "DASHSCOPE_API_KEY": self.dashscope_key_input.text().strip(),
                 "OFFICIAL_OPENAI_API_KEY": self.openai_key_input.text().strip(),
                 "WHISPER_CLI_PATH": self.whisper_cli_input.text().strip(),
@@ -2286,20 +3101,53 @@ class ControlUI(QMainWindow):
         self._restart_after_save("识别引擎配置已保存。")
 
     def save_behavior_settings(self) -> None:
+        hotkeys = self._hotkey_values()
+        if not self.refresh_hotkey_conflicts():
+            QMessageBox.warning(
+                self,
+                "快捷键冲突",
+                self.hotkey_conflict_label.text()
+                + "。请点击对应输入框，直接按下新的单键或组合键。",
+            )
+            return
+
         self.env_store.update(
             {
-                "TRANSCRIPTION_HOTKEY": self.hotkey_input.text().strip() or "alt_r",
+                "TRANSCRIPTION_HOTKEY": hotkeys["兼容听写"],
                 "TRANSCRIPTION_HOTKEY_MODE": self.hotkey_mode_combo.currentData(),
                 "AUDIO_ARCHIVE_MODE": self.archive_combo.currentData(),
                 "AUTO_RETRY_LIMIT": self.retry_spin.value(),
-                "TRANSLATION_SERVICE": "aliyun",
-                "TRANSLATION_TARGET_LANGUAGE": self.translation_language_combo.currentData(),
-                "TRANSLATION_HOTKEY": self.translation_hotkey_input.text().strip()
-                or "cmd_r",
+                "TRANSLATION_HOTKEY": hotkeys["兼容翻译"],
                 "TRANSLATION_HOTKEY_MODE": self.translation_hotkey_mode_combo.currentData(),
+                "DUAL_INPUT_MODE_ENABLED": str(
+                    self.dual_input_mode_check.isChecked()
+                ).lower(),
+                "FAST_INPUT_HOTKEY": hotkeys["极速输入"],
+                "SMART_INPUT_HOTKEY": hotkeys["智能纠错"],
+                "SMART_TRANSLATION_HOTKEY": hotkeys["语音翻译"],
+                "KNOWLEDGE_AGENT_HOTKEY": hotkeys["Agent 指令"],
+                "SMART_INPUT_CORRECTION_LEVEL": (
+                    self.smart_correction_level_combo.currentData()
+                ),
+                "HOTKEY_CHORD_DELAY_MS": self.hotkey_chord_delay_spin.value(),
             }
         )
-        self._restart_after_save("快捷键与翻译设置已保存。")
+        self._restart_after_save("快捷键设置已保存。")
+
+    def save_translation_settings(self) -> None:
+        self.env_store.update(
+            {
+                "TRANSLATION_SERVICE": "aliyun",
+                "TRANSLATION_TARGET_LANGUAGE": (
+                    self.translation_language_combo.currentData()
+                ),
+                "DASHSCOPE_TRANSLATION_MODEL": (
+                    self.translation_model_input.text().strip()
+                    or "qwen-mt-flash"
+                ),
+            }
+        )
+        self._restart_after_save("翻译设置已保存。")
 
     def save_history_retention(self, *_args: object) -> None:
         retention_days = int(self.history_retention_combo.currentData())
@@ -2331,10 +3179,25 @@ class ControlUI(QMainWindow):
                 "请为终端模式选择或输入一个按键。",
             )
             return
-        if terminal_mode_key in {
-            self.hotkey_input.text().strip().lower(),
-            self.translation_hotkey_input.text().strip().lower(),
-        }:
+        direct_hotkeys = (
+            (
+                self.fast_input_hotkey_input.hotkey(),
+                self.smart_input_hotkey_input.hotkey(),
+                self.smart_translation_hotkey_input.hotkey(),
+                self.agent_hotkey_input.hotkey(),
+            )
+            if self.dual_input_mode_check.isChecked()
+            else (
+                self.hotkey_input.hotkey(),
+                self.translation_hotkey_input.hotkey(),
+            )
+        )
+        direct_single_keys = {
+            tokens[0]
+            for hotkey in direct_hotkeys
+            if len(tokens := KeyboardManager._parse_hotkey(hotkey)) == 1
+        }
+        if terminal_mode_key in direct_single_keys:
             QMessageBox.warning(
                 self,
                 "快捷键冲突",
@@ -2366,6 +3229,102 @@ class ControlUI(QMainWindow):
             }
         )
         self._restart_after_save("粘贴与文本设置已保存。")
+
+    def refresh_agent_suggestions(self) -> None:
+        if not hasattr(self, "agent_suggestions_table"):
+            return
+        self._agent_suggestions = self.knowledge_agent.load_suggestions()
+        table = self.agent_suggestions_table
+        table.blockSignals(True)
+        table.setRowCount(len(self._agent_suggestions))
+        for row, suggestion in enumerate(self._agent_suggestions):
+            use_item = QTableWidgetItem()
+            use_item.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+            )
+            use_item.setCheckState(
+                Qt.Checked
+                if suggestion.confidence == "high"
+                else Qt.Unchecked
+            )
+            use_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row, 0, use_item)
+            values = [
+                suggestion.source,
+                suggestion.replacement,
+                str(suggestion.count),
+                "高" if suggestion.confidence == "high" else "中",
+                suggestion.reason,
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(value)
+                if column in {3, 4, 5}:
+                    item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(row, column, item)
+        table.blockSignals(False)
+        if self._agent_suggestions:
+            self.agent_status_label.setText(
+                f"当前有 {len(self._agent_suggestions)} 条候选，默认勾选高置信项。"
+            )
+
+    def scan_agent_history(self) -> None:
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._agent_suggestions = self.knowledge_agent.analyze_history(
+                days=self.agent_history_days_spin.value()
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "历史扫描失败", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.refresh_agent_suggestions()
+        self.agent_status_label.setText(
+            f"扫描完成，发现 {len(self._agent_suggestions)} 条候选。"
+        )
+
+    def apply_agent_suggestions(self) -> None:
+        applied = 0
+        for row, suggestion in enumerate(self._agent_suggestions):
+            item = self.agent_suggestions_table.item(row, 0)
+            if item is None or item.checkState() != Qt.Checked:
+                continue
+            self.glossary.save(suggestion.source, suggestion.replacement)
+            applied += 1
+        self.refresh_glossary()
+        self.agent_status_label.setText(f"已将 {applied} 条建议加入词库。")
+
+    def save_smart_agent_settings(self) -> None:
+        self.env_store.update(
+            {
+                "CORRECTION_UNDO_ENABLED": str(
+                    self.correction_undo_check.isChecked()
+                ).lower(),
+                "VOICE_EDIT_COMMANDS_ENABLED": str(
+                    self.voice_edit_commands_check.isChecked()
+                ).lower(),
+                "APP_PROFILE_ENABLED": str(
+                    self.app_profile_check.isChecked()
+                ).lower(),
+                "SELECTED_TEXT_AI_ENABLED": str(
+                    self.selected_text_ai_check.isChecked()
+                ).lower(),
+                "SELECTED_TEXT_MODEL": "qwen3.5-flash",
+                "GLOSSARY_LEARNING_ENABLED": str(
+                    self.glossary_learning_check.isChecked()
+                ).lower(),
+                "KNOWLEDGE_AGENT_ENABLED": str(
+                    self.knowledge_agent_enabled_check.isChecked()
+                ).lower(),
+                "KNOWLEDGE_AGENT_AUTOMATION": (
+                    self.agent_automation_combo.currentData()
+                ),
+                "KNOWLEDGE_AGENT_HISTORY_DAYS": (
+                    self.agent_history_days_spin.value()
+                ),
+            }
+        )
+        self._restart_after_save("智能与 Agent 设置已保存。")
 
     def save_persona_settings(self) -> None:
         active_id = self.active_persona_combo.currentData()

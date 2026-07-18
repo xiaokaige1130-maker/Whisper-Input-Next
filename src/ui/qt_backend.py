@@ -38,6 +38,14 @@ _STATE_VISUALS = {
         "#bd6b18",
         f"{APP_NAME} - 终端模式录音中",
     ),
+    InputState.RECORDING_AGENT: _StateVisual(
+        "#7b4fa3",
+        f"{APP_NAME} - Agent 指令录音中",
+    ),
+    InputState.RECORDING_SMART: _StateVisual(
+        "#c43131",
+        f"{APP_NAME} - 智能纠错录音中",
+    ),
     InputState.RECORDING_TRANSLATE: _StateVisual(
         "#c43131",
         f"{APP_NAME} - 翻译录音中",
@@ -51,6 +59,14 @@ _STATE_VISUALS = {
         f"{APP_NAME} - 流式识别中",
     ),
     InputState.PROCESSING: _StateVisual("#2f6fb4", f"{APP_NAME} - 转写中"),
+    InputState.PROCESSING_AGENT: _StateVisual(
+        "#7b4fa3",
+        f"{APP_NAME} - Agent 执行中",
+    ),
+    InputState.PROCESSING_SMART: _StateVisual(
+        "#2f6fb4",
+        f"{APP_NAME} - 智能纠错中",
+    ),
     InputState.PROCESSING_KIMI: _StateVisual(
         "#2f6fb4",
         f"{APP_NAME} - 本地转写中",

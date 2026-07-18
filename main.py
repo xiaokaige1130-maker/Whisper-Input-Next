@@ -15,9 +15,11 @@ load_dotenv()
 
 from src.audio.recorder import AudioRecorder
 from src.audio.archive import AudioArchiveManager
+from src.agent import KnowledgeAgent
 from src.correction import CORRECTION_LEVEL_LABELS, CorrectionProcessor
 from src.keyboard.listener import KeyboardManager, check_accessibility_permissions
 from src.keyboard.inputState import InputState
+from src.keyboard.paste_strategy import detect_active_window, is_terminal_context
 from src.transcription.whisper import WhisperProcessor
 from src.utils.logger import logger
 from src.transcription.local_whisper import LocalWhisperProcessor
@@ -29,6 +31,7 @@ from src.history.store import HistoryStore
 from src.llm.translate import TranslateProcessor
 from src.memory import PersonalMemoryStore
 from src.persona import PROVIDER_LABELS, PersonaProcessor
+from src.smart import SelectedTextProcessor, VoiceEditProcessor
 from src.terminal_mode import TerminalTextProcessor
 
 # 版本信息
@@ -94,6 +97,41 @@ class VoiceAssistant:
         self.memory_store = PersonalMemoryStore()
         self.persona_processor = PersonaProcessor(memory_store=self.memory_store)
         self.terminal_processor = TerminalTextProcessor()
+        self.knowledge_agent = KnowledgeAgent(
+            self.history_store,
+            self.glossary_processor.store,
+            self.memory_store,
+        )
+        self.voice_edit_processor = VoiceEditProcessor()
+        self.selected_text_processor = SelectedTextProcessor()
+        self.dual_input_mode_enabled = self._env_bool(
+            "DUAL_INPUT_MODE_ENABLED"
+        )
+        self.agent_enabled = self._env_bool("KNOWLEDGE_AGENT_ENABLED")
+        self.voice_edit_enabled = self._env_bool("VOICE_EDIT_COMMANDS_ENABLED")
+        self.app_profile_enabled = self._env_bool("APP_PROFILE_ENABLED")
+        self.selected_text_enabled = self._env_bool("SELECTED_TEXT_AI_ENABLED")
+        self.correction_undo_enabled = self._env_bool("CORRECTION_UNDO_ENABLED")
+        self.glossary_learning_enabled = self._env_bool(
+            "GLOSSARY_LEARNING_ENABLED"
+        )
+        self.smart_correction_level = os.getenv(
+            "SMART_INPUT_CORRECTION_LEVEL",
+            "medium",
+        )
+        self.agent_automation = os.getenv(
+            "KNOWLEDGE_AGENT_AUTOMATION",
+            "semi",
+        )
+        try:
+            self.agent_history_days = max(
+                0,
+                int(os.getenv("KNOWLEDGE_AGENT_HISTORY_DAYS", "7")),
+            )
+        except ValueError:
+            self.agent_history_days = 7
+        self._last_uncorrected_text = ""
+        self._last_output_text = ""
         logger.info(
             "词库与纠错已启用: %d 条规则",
             self.glossary_processor.store.enabled_count(),
@@ -149,7 +187,11 @@ class VoiceAssistant:
         self._streaming_history_recorded = False
 
         # 根据配置选择默认转录快捷键的处理方式
-        if self.transcription_service == "doubao" and self.doubao_processor and self.doubao_processor.is_available():
+        if self.dual_input_mode_enabled and self.openai_processor is not None:
+            default_transcription_start = self.start_openai_recording
+            default_transcription_stop = self.stop_openai_recording
+            logger.info("双键模式已启用：普通键使用批量快速转写")
+        elif self.transcription_service == "doubao" and self.doubao_processor and self.doubao_processor.is_available():
             default_transcription_start = self.start_doubao_streaming
             default_transcription_stop = self.stop_doubao_streaming
             logger.info("默认转录快捷键使用豆包流式识别")
@@ -172,6 +214,10 @@ class VoiceAssistant:
             on_kimi_stop=self.stop_local_recording,
             on_reset_state=self.reset_state,
             on_state_change=self._on_state_change,
+            on_smart_start=self.start_smart_recording,
+            on_smart_stop=self.stop_smart_recording,
+            on_agent_start=self.start_agent_recording,
+            on_agent_stop=self.stop_agent_recording,
         )
 
         # 使用状态栏反馈状态，不再向输入框输出"0"/"1"
@@ -193,6 +239,16 @@ class VoiceAssistant:
 
         # 初始化状态栏显示
         self._notify_status()
+
+    @staticmethod
+    def _env_bool(name: str, default: bool = False) -> bool:
+        fallback = "true" if default else "false"
+        return os.getenv(name, fallback).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _handle_auto_stop(self):
         """处理自动停止录音的情况"""
@@ -224,8 +280,18 @@ class VoiceAssistant:
         elif self._current_state in {
             InputState.RECORDING,
             InputState.RECORDING_TERMINAL,
+            InputState.RECORDING_AGENT,
+            InputState.RECORDING_SMART,
         }:
-            self.stop_openai_recording()
+            if self._current_state == InputState.RECORDING_SMART:
+                self.stop_smart_recording()
+            elif (
+                self._current_state == InputState.RECORDING_AGENT
+                and self.keyboard_manager.direct_agent_recording
+            ):
+                self.stop_agent_recording()
+            else:
+                self.stop_openai_recording()
         elif self._current_state == InputState.RECORDING_TRANSLATE:
             self.stop_translation_recording()
         elif self._current_state == InputState.RECORDING_KIMI:
@@ -313,11 +379,7 @@ class VoiceAssistant:
 
         buffer = io.BytesIO(job.audio_bytes)
         started_at = time.monotonic()
-        asr_mode = (
-            "transcriptions"
-            if job.mode in {"translations", "terminal"}
-            else job.mode
-        )
+        asr_mode = "transcriptions"
         try:
             if job.processor == "openai":
                 if self.openai_processor is None:
@@ -369,21 +431,108 @@ class VoiceAssistant:
             return
 
         text = self.glossary_processor.apply(text)
-        text = self.correction_processor.correct(text)
-        quick_reply = self.memory_store.resolve_quick_reply(text)
+        uncorrected_text = text
+        normalized_command = text.strip().rstrip("。.!！?？")
+        if (
+            self.correction_undo_enabled
+            and normalized_command == "撤销上次纠错"
+            and self._last_uncorrected_text
+        ):
+            self.keyboard_manager.undo_and_type_text(self._last_uncorrected_text)
+            logger.info("已撤销上次纠错并恢复原始转写")
+            self.keyboard_manager.reset_state()
+            return
+
+        service, model = self._get_job_cache_metadata(job)
+        history_mode = job.mode
+        correction_applied = False
+        agent_action = ""
+
+        if job.mode == "agent":
+            automation = (
+                self.agent_automation
+                if self.glossary_learning_enabled
+                else "suggest"
+            )
+            result = self.knowledge_agent.execute(
+                text,
+                default_days=self.agent_history_days,
+                automation=automation,
+            )
+            text = result.message
+            agent_action = result.action
+            service = f"{service}+local-agent"
+            model = f"{model} → rules"
+        elif job.mode == "smart":
+            corrected = self.correction_processor.correct(
+                text,
+                level=self.smart_correction_level,
+            )
+            correction_applied = (
+                self.correction_processor.enabled
+                and not self.correction_processor.last_error
+            )
+            text = corrected
+        elif job.mode != "fast":
+            corrected = self.correction_processor.correct(text)
+            correction_applied = (
+                self.correction_processor.enabled
+                and not self.correction_processor.last_error
+            )
+            text = corrected
+
+        selected_instruction = (
+            self.selected_text_processor.instruction(text)
+            if self.selected_text_enabled and job.mode != "agent"
+            else None
+        )
+        if selected_instruction:
+            selected_text = self.keyboard_manager.copy_selected_text()
+            try:
+                text = self.selected_text_processor.rewrite(
+                    selected_text,
+                    selected_instruction,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._handle_transcription_failure(
+                    job,
+                    f"选中文字处理失败: {exc}",
+                    latency_seconds=time.monotonic() - started_at,
+                )
+                return
+            service = f"{service}+selected-text-qwen"
+            model = f"{model} → {os.getenv('SELECTED_TEXT_MODEL', 'qwen3.5-flash')}"
+            history_mode = "selected-text"
+
+        quick_reply = (
+            self.memory_store.resolve_quick_reply(text)
+            if job.mode not in {"agent", "fast"} and not selected_instruction
+            else text
+        )
         quick_reply_used = quick_reply != text
         if quick_reply_used:
             text = quick_reply
             logger.info("已使用本地快捷回复: %s", text)
-        if job.mode == "terminal":
+        terminal_mode = job.mode == "terminal"
+        if (
+            self.app_profile_enabled
+            and job.mode in {"transcriptions", "fast", "smart"}
+        ):
+            terminal_mode = is_terminal_context(
+                detect_active_window(),
+                os.getenv("PASTE_TERMINAL_HINTS", ""),
+            )
+        if terminal_mode:
             text = self.terminal_processor.process(text)
             logger.info("终端模式结果: %s", text)
+        if self.voice_edit_enabled and job.mode != "agent":
+            text = self.voice_edit_processor.process(text)
         latency_seconds = time.monotonic() - started_at
-        service, model = self._get_job_cache_metadata(job)
-        if self.correction_processor.enabled and not self.correction_processor.last_error:
+        if correction_applied:
             service = f"{service}+correction-qwen"
             model = f"{model} → {self.correction_processor.model}"
-        history_mode = "quick-reply" if quick_reply_used else job.mode
+        if quick_reply_used:
+            history_mode = "quick-reply"
         if (
             job.mode == "transcriptions"
             and not quick_reply_used
@@ -474,7 +623,13 @@ class VoiceAssistant:
             audio_path=job.archive_path,
             attempt=job.attempt,
         )
-        self.keyboard_manager.type_text(text, error)
+        if job.mode in {"transcriptions", "smart"} and text != uncorrected_text:
+            self._last_uncorrected_text = uncorrected_text
+            self._last_output_text = text
+        if job.mode == "agent" and agent_action == "open":
+            self.keyboard_manager.reset_state()
+        else:
+            self.keyboard_manager.type_text(text, error)
         logger.info(f"✅ 转录成功 (尝试 {job.attempt})")
         self._notify_status()
 
@@ -587,11 +742,14 @@ class VoiceAssistant:
 
     def stop_openai_recording(self):
         """停止录音并处理（批量转录模式）"""
-        job_mode = (
-            "terminal"
-            if self.keyboard_manager.consume_terminal_mode()
-            else "transcriptions"
-        )
+        if self.keyboard_manager.consume_agent_mode() is True:
+            job_mode = "agent"
+        elif self.keyboard_manager.consume_terminal_mode() is True:
+            job_mode = "terminal"
+        elif self.dual_input_mode_enabled:
+            job_mode = "fast"
+        else:
+            job_mode = "transcriptions"
         audio = self.audio_recorder.stop_recording()
         if audio == "TOO_SHORT":
             logger.warning("录音时长太短，状态将重置")
@@ -609,6 +767,62 @@ class VoiceAssistant:
             audio_bytes,
             "openai",
             mode=job_mode,
+            archive_path=archive_path,
+            max_retries=self.max_auto_retries,
+            duration_seconds=self._audio_duration_seconds(audio_bytes),
+        )
+
+    def start_smart_recording(self):
+        """开始智能纠错录音，复用批量 ASR。"""
+        self.start_openai_recording()
+
+    def stop_smart_recording(self):
+        """停止录音并加入智能纠错队列。"""
+        audio = self.audio_recorder.stop_recording()
+        if audio == "TOO_SHORT":
+            logger.warning("录音时长太短，状态将重置")
+            self.keyboard_manager.reset_state()
+            return
+
+        audio_bytes = self._buffer_to_bytes(audio)
+        if not audio_bytes:
+            logger.error("没有录音数据，状态将重置")
+            self.keyboard_manager.reset_state()
+            return
+
+        archive_path = self._archive_audio_bytes(audio_bytes)
+        self._queue_job(
+            audio_bytes,
+            "openai",
+            mode="smart",
+            archive_path=archive_path,
+            max_retries=self.max_auto_retries,
+            duration_seconds=self._audio_duration_seconds(audio_bytes),
+        )
+
+    def start_agent_recording(self):
+        """开始知识库 Agent 指令录音。"""
+        self.start_openai_recording()
+
+    def stop_agent_recording(self):
+        """停止录音并加入知识库 Agent 队列。"""
+        audio = self.audio_recorder.stop_recording()
+        if audio == "TOO_SHORT":
+            logger.warning("Agent 指令录音时长太短，状态将重置")
+            self.keyboard_manager.reset_state()
+            return
+
+        audio_bytes = self._buffer_to_bytes(audio)
+        if not audio_bytes:
+            logger.error("Agent 没有录音数据，状态将重置")
+            self.keyboard_manager.reset_state()
+            return
+
+        archive_path = self._archive_audio_bytes(audio_bytes)
+        self._queue_job(
+            audio_bytes,
+            "openai",
+            mode="agent",
             archive_path=archive_path,
             max_retries=self.max_auto_retries,
             duration_seconds=self._audio_duration_seconds(audio_bytes),

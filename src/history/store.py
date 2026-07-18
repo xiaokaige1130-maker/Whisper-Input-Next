@@ -196,6 +196,29 @@ class HistoryStore:
             ).fetchone()
         return int(row["total"] or 0)
 
+    def successful_texts(self, *, days: int = 7, limit: int = 5000) -> list[str]:
+        limit = max(1, min(100_000, int(limit)))
+        clauses = ["status = 'success'", "text != ''"]
+        parameters: list[object] = []
+        if days > 0:
+            cutoff = (
+                datetime.now().astimezone() - timedelta(days=int(days))
+            ).isoformat(timespec="seconds")
+            clauses.append("created_at >= ?")
+            parameters.append(cutoff)
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT text FROM transcriptions
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [str(row["text"]) for row in rows]
+
     def configure_retention(
         self,
         *,

@@ -82,7 +82,7 @@ class CorrectionProcessor:
     def is_enabled(self) -> bool:
         return self.enabled and self.is_available()
 
-    def correct(self, text: str) -> str:
+    def correct(self, text: str, *, level: str | None = None) -> str:
         self.last_changed = False
         self.last_error = None
         if not text or not self.enabled:
@@ -93,9 +93,10 @@ class CorrectionProcessor:
             return text
 
         try:
+            selected_level = self._normalize_level(level or self.level)
             response = self._get_client().chat.completions.create(
                 model=self.model,
-                messages=self._messages(text),
+                messages=self._messages(text, selected_level),
                 temperature=0,
                 max_tokens=self._max_tokens(),
                 extra_body={"enable_thinking": False},
@@ -119,11 +120,12 @@ class CorrectionProcessor:
             logger.info("AI 纠错完成，原文无需修改")
         return corrected
 
-    def _messages(self, text: str) -> list[dict[str, str]]:
+    def _messages(self, text: str, level: str | None = None) -> list[dict[str, str]]:
+        selected_level = self._normalize_level(level or self.level)
         glossary = self._glossary_context()
         user_parts = [
-            f"纠错级别：{CORRECTION_LEVEL_LABELS[self.level]}",
-            f"本级规则：{_LEVEL_RULES[self.level]}",
+            f"纠错级别：{CORRECTION_LEVEL_LABELS[selected_level]}",
+            f"本级规则：{_LEVEL_RULES[selected_level]}",
         ]
         if glossary:
             user_parts.append(
@@ -162,6 +164,14 @@ class CorrectionProcessor:
                 "content": "\n\n".join(user_parts),
             },
         ]
+
+    @staticmethod
+    def _normalize_level(value: str) -> str:
+        normalized = _LEGACY_LEVEL_ALIASES.get(
+            value.strip().lower(),
+            value.strip().lower(),
+        )
+        return normalized if normalized in _LEVEL_RULES else "light"
 
     def _glossary_context(self) -> str:
         lines: list[str] = []
