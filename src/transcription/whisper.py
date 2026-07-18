@@ -2,14 +2,13 @@ import os
 import threading
 import time
 import base64
-import re
 from functools import wraps
 
 import dotenv
 from openai import OpenAI
-from opencc import OpenCC
 
 from ..llm.symbol import SymbolProcessor
+from ..text_processing import TextPostProcessor
 from ..utils.logger import logger
 
 dotenv.load_dotenv()
@@ -50,11 +49,9 @@ class WhisperProcessor:
     DEFAULT_MODEL = None
     
     def __init__(self):
-        self.convert_to_simplified = os.getenv("CONVERT_TO_SIMPLIFIED", "false").lower() == "true"
-        self.cc = OpenCC('t2s') if self.convert_to_simplified else None
+        self.text_postprocessor = TextPostProcessor.from_environment()
         self.add_symbol = os.getenv("ADD_SYMBOL", "false").lower() == "true"
         self.optimize_result = os.getenv("OPTIMIZE_RESULT", "false").lower() == "true"
-        self.clean_fillers = os.getenv("CLEAN_ASR_FILLERS", "true").lower() == "true"
         self.symbol = SymbolProcessor() if self.add_symbol or self.optimize_result else None
         self.service_platform = os.getenv("SERVICE_PLATFORM", "groq").lower()
         self.timeout_seconds = self.OPENAI_TIMEOUT if self.service_platform == "openai" else self.DEFAULT_TIMEOUT
@@ -94,46 +91,6 @@ class WhisperProcessor:
         else:
             raise ValueError(f"未知的平台: {self.service_platform}")
         
-    def _convert_traditional_to_simplified(self, text):
-        """将繁体中文转换为简体中文"""
-        if not self.convert_to_simplified or not text:
-            return text
-        return self.cc.convert(text)
-
-    def _clean_asr_fillers(self, text: str) -> str:
-        """做保守的口语清理，不调用额外模型。"""
-        if not self.clean_fillers or not text:
-            return text
-
-        cleaned = text.strip()
-
-        # 删除常见停顿词和口头禅。限定在标点/空白边界附近，避免误删词语内部字符。
-        filler_patterns = [
-            r"(?:(?<=^)|(?<=[\s，,。.!！？?；;：:、]))(?:嗯+|呃+|额+|啊+|呐+|唔+|em+|emm+|呃嗯+)[\s，,。.!！？?；;：:、]*",
-            r"[\s，,。.!！？?；;：:、]*(?:嗯+|呃+|额+|啊+|呐+|唔+|em+|emm+|呃嗯+)(?=$|[\s，,。.!！？?；;：:、])",
-            r"(?:(?<=^)|(?<=[\s，,。.!！？?；;：:、]))(?:这个|那个|就是|然后呢|然后|怎么说呢|怎么讲呢|你知道吧|对吧|是吧)[\s，,。.!！？?；;：:、]*",
-        ]
-        for pattern in filler_patterns:
-            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-
-        # 压缩短重复：我我、他他、这个这个、然后然后。
-        repeat_words = [
-            "我", "你", "他", "她", "它", "这", "那", "是", "有", "要", "会", "就",
-            "这个", "那个", "然后", "但是", "如果", "因为", "所以",
-        ]
-        for word in repeat_words:
-            cleaned = re.sub(f"(?:{re.escape(word)}){{2,}}", word, cleaned)
-
-        # 清理标点和空白，让删除停顿词后的句子更自然。
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        cleaned = re.sub(r"[，,、]{2,}", "，", cleaned)
-        cleaned = re.sub(r"[。.!！？?；;：:]{2,}", lambda m: m.group(0)[0], cleaned)
-        cleaned = re.sub(r"^[\s，,。.!！？?；;：:、]+", "", cleaned)
-        cleaned = re.sub(r"[\s，,、]+([。.!！？?；;：:])", r"\1", cleaned)
-        cleaned = re.sub(r"([，,。.!！？?；;：:、])\s+", r"\1", cleaned)
-
-        return cleaned.strip()
-    
     @timeout_decorator(180)  # OpenAI 专用超时时间
     def _call_openai_api(self, mode, audio_data, prompt):
         """调用 OpenAI GPT-4o transcribe API"""
@@ -233,8 +190,7 @@ class WhisperProcessor:
             result = self._call_whisper_api(mode, audio_buffer, prompt)
 
             logger.info(f"API 调用成功 ({mode}), 耗时: {time.time() - start_time:.1f}秒")
-            result = self._convert_traditional_to_simplified(result)
-            result = self._clean_asr_fillers(result)
+            result = self.text_postprocessor.process(result)
             logger.info(f"识别结果: {result}")
             
             # OpenAI GPT-4o transcribe 自带标点符号，无需额外处理

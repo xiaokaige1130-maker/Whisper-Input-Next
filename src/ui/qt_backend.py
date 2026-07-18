@@ -34,6 +34,10 @@ class _StateVisual:
 _STATE_VISUALS = {
     InputState.IDLE: _StateVisual("#2f8f46", f"{APP_NAME} - 空闲"),
     InputState.RECORDING: _StateVisual("#c43131", f"{APP_NAME} - 录音中"),
+    InputState.RECORDING_TERMINAL: _StateVisual(
+        "#bd6b18",
+        f"{APP_NAME} - 终端模式录音中",
+    ),
     InputState.RECORDING_TRANSLATE: _StateVisual(
         "#c43131",
         f"{APP_NAME} - 翻译录音中",

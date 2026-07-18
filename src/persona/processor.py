@@ -8,6 +8,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from src.memory import PersonalMemoryStore
 from src.utils.logger import logger
 
 from .store import PersonaEntry, PersonaStore
@@ -27,10 +28,12 @@ class PersonaProcessor:
         *,
         clients: Mapping[str, Any] | None = None,
         settings: Mapping[str, str] | None = None,
+        memory_store: PersonalMemoryStore | None = None,
     ) -> None:
         self.store = store or PersonaStore()
         self._clients = dict(clients or {})
         self._settings = dict(settings or {})
+        self.memory_store = memory_store or PersonalMemoryStore()
         self.last_provider: str | None = None
 
     @property
@@ -254,8 +257,30 @@ class PersonaProcessor:
         self._clients[provider] = client
         return client
 
-    @staticmethod
-    def _messages(text: str, persona: PersonaEntry) -> list[dict[str, str]]:
+    def _messages(
+        self,
+        text: str,
+        persona: PersonaEntry,
+    ) -> list[dict[str, str]]:
+        memory = ""
+        if self._get_bool("PERSONAL_MEMORY_ENABLED", True):
+            memory = self.memory_store.context_for(
+                text,
+                max_chars=self._memory_max_chars(),
+            ).render()
+
+        user_parts = [
+            f"人设名称：{persona.name}",
+            f"改写要求：{persona.instruction}",
+        ]
+        if memory:
+            user_parts.append(
+                "下面是用户本地保存的个人资料。"
+                "只在相关时参考其中的事实、固定说法和表达习惯；"
+                "资料未提及的内容不要补充：\n"
+                f"{memory}"
+            )
+        user_parts.append(f"原文：{text}")
         return [
             {
                 "role": "system",
@@ -268,13 +293,16 @@ class PersonaProcessor:
             },
             {
                 "role": "user",
-                "content": (
-                    f"人设名称：{persona.name}\n"
-                    f"改写要求：{persona.instruction}\n"
-                    f"原文：{text}"
-                ),
+                "content": "\n\n".join(user_parts),
             },
         ]
+
+    def _memory_max_chars(self) -> int:
+        try:
+            value = int(self._get("PERSONAL_MEMORY_MAX_CHARS", "3200"))
+        except (TypeError, ValueError):
+            value = 3200
+        return max(500, min(12_000, value))
 
     def _temperature(self) -> float:
         try:

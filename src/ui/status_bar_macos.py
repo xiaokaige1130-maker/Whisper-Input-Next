@@ -33,6 +33,11 @@ class _StateVisual:
 _STATE_VISUALS = {
     InputState.IDLE: _StateVisual("🎙️", "空闲", "IDLE"),
     InputState.RECORDING: _StateVisual("🔴", "录音中 (OpenAI)", "RECORDING"),
+    InputState.RECORDING_TERMINAL: _StateVisual(
+        "⌨️",
+        "录音中 (终端模式)",
+        "RECORDING",
+    ),
     InputState.RECORDING_TRANSLATE: _StateVisual("🔴", "录音中 (翻译)", "RECORDING"),
     InputState.RECORDING_KIMI: _StateVisual("🟠", "录音中 (本地 Whisper)", "RECORDING"),
     InputState.DOUBAO_STREAMING: _StateVisual("🟢", "流式识别中 (豆包)", "RECORDING"),

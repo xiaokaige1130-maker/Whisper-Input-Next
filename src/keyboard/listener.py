@@ -3,6 +3,7 @@ import pyperclip
 from ..utils.logger import logger
 import time
 from .inputState import InputState
+from .paste_strategy import detect_active_window, resolve_paste_hotkey
 import os
 
 
@@ -71,6 +72,8 @@ class KeyboardManager:
         self.i_pressed = False  # I键状态
         self.single_hotkey_pressed = False
         self.single_translation_hotkey_pressed = False
+        self.terminal_mode_key_pressed = False
+        self.terminal_mode_active = False
         self.temp_text_length = 0  # 用于跟踪临时文本的长度
         self.processing_text = None  # 用于跟踪正在处理的文本
         self.error_message = None  # 用于跟踪错误信息
@@ -96,6 +99,7 @@ class KeyboardManager:
         self._state_messages = {
             InputState.IDLE: "",
             InputState.RECORDING: "0",
+            InputState.RECORDING_TERMINAL: "0",
             InputState.RECORDING_TRANSLATE: "0",
             InputState.RECORDING_KIMI: "0",
             InputState.PROCESSING: "1",
@@ -165,6 +169,25 @@ class KeyboardManager:
             logger.error("翻译快捷键与转写快捷键冲突，已禁用翻译快捷键")
             self.single_translation_hotkey = None
 
+        self.terminal_mode_enabled = (
+            os.getenv("TERMINAL_MODE_ENABLED", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.terminal_mode_key = None
+        self.terminal_mode_key_display = ""
+        if self.terminal_mode_enabled:
+            (
+                self.terminal_mode_key,
+                self.terminal_mode_key_display,
+            ) = self._resolve_button("TERMINAL_MODE_KEY", "m")
+            if self.terminal_mode_key in {
+                self.single_transcription_hotkey,
+                self.single_translation_hotkey,
+            }:
+                logger.error("终端模式键与录音快捷键冲突，已禁用终端模式")
+                self.terminal_mode_enabled = False
+                self.terminal_mode_key = None
+
         if self.single_transcription_hotkey is not None:
             if self.single_transcription_hotkey_mode == "hold":
                 logger.info(f"按住 {self.single_transcription_hotkey_display} 键：开始录音，松开停止并转写")
@@ -182,6 +205,11 @@ class KeyboardManager:
                 "翻译快捷键 %s：%s",
                 self.single_translation_hotkey_display,
                 action,
+            )
+        if self.terminal_mode_enabled:
+            logger.info(
+                "终端模式已启用：录音期间按 %s 切换本次输入",
+                self.terminal_mode_key_display,
             )
         logger.info(f"按 {modifier_display}+I 键：切换录音状态（本地 Whisper 模式）")
         logger.info(f"两种模式都是按一下开始，再按一下结束")
@@ -201,7 +229,7 @@ class KeyboardManager:
 
     @classmethod
     def _parse_button(cls, button_name):
-        if len(button_name) == 1 and button_name.isalpha():
+        if len(button_name) == 1:
             return button_name
 
         if button_name in cls.KEY_ALIASES:
@@ -223,7 +251,11 @@ class KeyboardManager:
     @staticmethod
     def _key_matches(key, configured_key):
         if isinstance(configured_key, str):
-            return hasattr(key, "char") and key.char and key.char.lower() == configured_key
+            return (
+                hasattr(key, "char")
+                and key.char
+                and key.char.lower() == configured_key.lower()
+            )
 
         if key == configured_key:
             return True
@@ -257,10 +289,16 @@ class KeyboardManager:
             # 根据状态转换类型显示不同消息
             if new_state == InputState.RECORDING:
                 # 录音状态
+                self.terminal_mode_active = False
+                self.terminal_mode_key_pressed = False
                 self.temp_text_length = 0
                 if self.state_symbol_enabled:
                     self.type_temp_text(message)
                 self.on_record_start()
+
+            elif new_state == InputState.RECORDING_TERMINAL:
+                # 录音已经开始，只切换本次任务的处理模式。
+                self.processing_text = "terminal"
                 
             elif new_state == InputState.RECORDING_TRANSLATE:
                 # 翻译,录音状态
@@ -357,16 +395,29 @@ class KeyboardManager:
     
     def _paste_text_from_clipboard(self, text: str) -> None:
         pyperclip.copy(text)
-        hotkey = os.getenv("PASTE_HOTKEY")
-        if not hotkey:
-            if self.system_platform == "linux":
-                hotkey = "ctrl+shift+v"
-            elif self.system_platform in ("win", "windows"):
-                hotkey = "ctrl+v"
-            else:
-                hotkey = "cmd+v"
+        try:
+            delay_ms = int(os.getenv("PASTE_DELAY_MS", "80"))
+        except ValueError:
+            delay_ms = 80
+        time.sleep(max(0, min(delay_ms, 1000)) / 1000)
 
-        normalized = hotkey.replace("+", "+").lower()
+        context = detect_active_window()
+        configured_mode = os.getenv("PASTE_HOTKEY", "auto")
+        hotkey = resolve_paste_hotkey(
+            configured_mode,
+            self.system_platform,
+            context=context,
+            extra_hints=os.getenv("PASTE_TERMINAL_HINTS", ""),
+        )
+        logger.debug(
+            "粘贴策略: mode=%s resolved=%s class=%s process=%s",
+            configured_mode,
+            hotkey,
+            context.window_class or "-",
+            context.process_name or "-",
+        )
+
+        normalized = hotkey.lower()
         key_map = {
             "ctrl": Key.ctrl,
             "control": Key.ctrl,
@@ -376,9 +427,15 @@ class KeyboardManager:
             "alt": Key.alt,
             "option": Key.alt,
         }
+        final_key_map = {
+            "insert": Key.insert,
+            "enter": Key.enter,
+            "return": Key.enter,
+        }
         parts = [part for part in normalized.split("+") if part]
         modifiers = [key_map[part] for part in parts[:-1] if part in key_map]
-        final_key = parts[-1] if parts else "v"
+        final_name = parts[-1] if parts else "v"
+        final_key = final_key_map.get(final_name, final_name)
 
         try:
             for modifier in modifiers:
@@ -575,9 +632,47 @@ class KeyboardManager:
             self.state = InputState.PROCESSING
             logger.info("⏹️ 停止录音（按住说话模式）")
 
+    def activate_terminal_mode(self) -> bool:
+        """将当前普通听写切换为终端模式。"""
+        if (
+            not self.terminal_mode_enabled
+            or self.terminal_mode_key is None
+            or not self.is_recording
+            or self.state
+            not in {InputState.RECORDING, InputState.RECORDING_TERMINAL}
+        ):
+            return False
+        if self.terminal_mode_active:
+            return True
+
+        self.terminal_mode_active = True
+        self.state = InputState.RECORDING_TERMINAL
+        logger.info("⌨️ 本次录音已切换为终端模式")
+        return True
+
+    def consume_terminal_mode(self) -> bool:
+        """读取并清除本次录音的终端模式标记。"""
+        active = self.terminal_mode_active
+        self.terminal_mode_active = False
+        self.terminal_mode_key_pressed = False
+        return active
+
     def on_press(self, key):
         """按键按下时的回调"""
         try:
+            if (
+                self.terminal_mode_enabled
+                and self.terminal_mode_key is not None
+                and self._key_matches(key, self.terminal_mode_key)
+                and self.is_recording
+                and self.state
+                in {InputState.RECORDING, InputState.RECORDING_TERMINAL}
+            ):
+                if not self.terminal_mode_key_pressed:
+                    self.terminal_mode_key_pressed = True
+                    self.activate_terminal_mode()
+                return
+
             if (
                 self.single_translation_hotkey is not None
                 and self._key_matches(key, self.single_translation_hotkey)
@@ -630,6 +725,14 @@ class KeyboardManager:
         """按键释放时的回调"""
         try:
             if (
+                self.terminal_mode_enabled
+                and self.terminal_mode_key is not None
+                and self._key_matches(key, self.terminal_mode_key)
+            ):
+                self.terminal_mode_key_pressed = False
+                return
+
+            if (
                 self.single_translation_hotkey is not None
                 and self._key_matches(key, self.single_translation_hotkey)
             ):
@@ -678,6 +781,8 @@ class KeyboardManager:
         self.i_pressed = False
         self.single_hotkey_pressed = False
         self.single_translation_hotkey_pressed = False
+        self.terminal_mode_key_pressed = False
+        self.terminal_mode_active = False
         self.is_recording = False
         self.last_key_time = time.time()
         self.processing_text = None

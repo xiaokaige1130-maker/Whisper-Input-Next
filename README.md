@@ -103,9 +103,24 @@ TRANSLATION_HOTKEY_MODE=hold
 
 TRANSCRIPTION_HOTKEY=alt_r
 TRANSCRIPTION_HOTKEY_MODE=hold
+
+PASTE_HOTKEY=auto
+PASTE_DELAY_MS=80
+HISTORY_RETENTION_DAYS=1
+HISTORY_MAX_RECORDS=5000
+TERMINAL_MODE_ENABLED=false
+TERMINAL_MODE_KEY=m
+CHINESE_CONVERSION=none
+CLEAN_ASR_FILLERS=true
+NORMALIZE_TRANSCRIPT_TEXT=true
+SMART_SENTENCE_ENDING=false
 ```
 
 `TRANSLATION_TARGET_LANGUAGE` 支持 `en`、`ja`、`ru`、`ko`、`fr`、`de`、`es`、`pt`、`it`、`ar` 和 `zh`。修改控制台设置后点击“保存并重启”即可加载新目标语言。
+
+“粘贴与文本”页面提供智能粘贴模式。普通桌面应用使用 `Ctrl+V`，Linux 终端和 CLI 使用 `Ctrl+Shift+V`；也可以固定使用 `Shift+Insert`。本地文字处理支持繁体转简体、简体转繁体、口头禅与短重复清理、空格与重复标点规范化，以及可选的句末标点补全。
+
+终端模式可单独开启并设置模式键。按住普通听写键开始录音后，再按一次模式键，本次结果会跳过人设改写、移除句末语气标点，并将“空格、斜杠、双横杠、管道符、等号、艾特”等明确口述转换为命令符号。程序只粘贴结果，不会自动发送回车执行命令。
 
 ### 人设与实时改写
 
@@ -123,6 +138,15 @@ ARK_REWRITE_MODEL=doubao-seed-2-0-mini-260428
 ```
 
 Qwen 改写复用 `DASHSCOPE_API_KEY`。Qwen 和火山方舟都关闭思考模式，避免实时输入时把时间和输出额度消耗在推理内容上；如果所有改写模型都失败，程序会输入原始转写结果。
+
+### 轻量个人资料库
+
+控制台提供“个人资料库”页面，资料以 Markdown 保存在
+`data/memory/`。表达风格会用于人设改写，固定回复和
+`knowledge/` 下的知识文件按关键词选取，不需要向量数据库或本地大模型。
+
+语音说“快捷回复 + 分组名”可直接展开固定回复，例如“快捷回复 稍后回复”。
+这个过程完全在本机完成，不调用语言模型。
 
 ### 词库与自动纠错
 

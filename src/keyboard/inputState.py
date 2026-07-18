@@ -5,6 +5,7 @@ class InputState(Enum):
     """输入状态枚举"""
     IDLE = auto()           # 空闲状态
     RECORDING = auto()      # 正在录音
+    RECORDING_TERMINAL = auto()  # 正在录音（终端模式）
     RECORDING_TRANSLATE = auto()  # 正在录音(翻译模式)
     RECORDING_KIMI = auto()     # 正在录音(Kimi润色模式)
     DOUBAO_STREAMING = auto()   # 豆包流式识别中（边说边转）
@@ -17,7 +18,13 @@ class InputState(Enum):
     @property
     def is_recording(self):
         """检查是否处于录音状态"""
-        return self in (InputState.RECORDING, InputState.RECORDING_TRANSLATE, InputState.RECORDING_KIMI, InputState.DOUBAO_STREAMING)
+        return self in (
+            InputState.RECORDING,
+            InputState.RECORDING_TERMINAL,
+            InputState.RECORDING_TRANSLATE,
+            InputState.RECORDING_KIMI,
+            InputState.DOUBAO_STREAMING,
+        )
     
     @property
     def can_start_recording(self):

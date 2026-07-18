@@ -56,3 +56,5 @@ data/glossary.db-wal
 data/personas.db
 data/personas.db-shm
 data/personas.db-wal
+data/memory/
+data/backups/

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import sounddevice as sd
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QBrush, QColor, QFont, QIcon
+from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtGui import QBrush, QColor, QDesktopServices, QFont, QIcon
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -30,19 +31,24 @@ from PyQt5.QtWidgets import (
     QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from src.control import EnvStore, ServiceManager
+from src.correction import CORRECTION_LEVEL_LABELS
 from src.glossary import GlossaryEntry, GlossaryProcessor, GlossaryStore
 from src.history import HistoryStore, TranscriptionRecord
 from src.llm.translate import TARGET_LANGUAGE_LABELS
+from src.memory import PersonalMemoryStore
 from src.persona import PersonaEntry, PersonaProcessor, PersonaStore
 
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "小凯哥语音输入法"
+APP_ID = "whisper-input-control"
+APP_ICON_PATH = ROOT / "assets" / "icons" / "whisper-input.png"
 
 SERVICE_LABELS = {
     "aliyun": "阿里云 Qwen ASR",
@@ -163,6 +169,16 @@ def repolish(widget: QWidget) -> None:
     widget.update()
 
 
+def configure_qt_application(app: QApplication) -> None:
+    app.setApplicationName(APP_ID)
+    if hasattr(app, "setApplicationDisplayName"):
+        app.setApplicationDisplayName(APP_NAME)
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName(APP_ID)
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+
+
 class MetricCard(QFrame):
     def __init__(self, title: str, subtitle: str) -> None:
         super().__init__()
@@ -189,12 +205,16 @@ class MetricCard(QFrame):
 
 
 class ControlUI(QMainWindow):
+    HISTORY_PAGE_SIZE = 100
+
     PAGE_TITLES = [
         "概览",
         "历史记录",
         "识别引擎",
-        "快捷键与文本",
+        "快捷键与翻译",
+        "粘贴与文本",
         "词库与纠错",
+        "个人资料库",
         "人设与改写",
         "诊断",
     ]
@@ -204,11 +224,32 @@ class ControlUI(QMainWindow):
         self.root = Path(root)
         self.env_store = EnvStore(self.root / ".env")
         self.service = ServiceManager(self.root)
-        self.history = HistoryStore(self.root / "data" / "history.db")
+        initial_env = self.env_store.read()
+        self._history_retention_days = self.env_store.get_int(
+            initial_env,
+            "HISTORY_RETENTION_DAYS",
+            1,
+            minimum=0,
+            maximum=3650,
+        )
+        self._history_max_records = self.env_store.get_int(
+            initial_env,
+            "HISTORY_MAX_RECORDS",
+            5000,
+            minimum=0,
+            maximum=1_000_000,
+        )
+        self.history = HistoryStore(
+            self.root / "data" / "history.db",
+            retention_days=self._history_retention_days,
+            max_records=self._history_max_records,
+        )
         self.glossary = GlossaryStore(self.root / "data" / "glossary.db")
         self.glossary_processor = GlossaryProcessor(self.glossary)
+        self.memory_store = PersonalMemoryStore(self.root / "data" / "memory")
         self.personas = PersonaStore(self.root / "data" / "personas.db")
         self._history_rows: list[TranscriptionRecord] = []
+        self._history_page = 0
         self._glossary_rows: list[GlossaryEntry] = []
         self._persona_rows: list[PersonaEntry] = []
         self._editing_glossary_id: int | None = None
@@ -220,9 +261,8 @@ class ControlUI(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1080, 720)
         self.resize(1240, 820)
-        icon_path = self.root / "assets" / "icons" / "whisper-input.png"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
 
         self._build_ui()
         self._apply_styles()
@@ -290,7 +330,9 @@ class ControlUI(QMainWindow):
         self.stack.addWidget(self._build_history_page())
         self.stack.addWidget(self._build_engines_page())
         self.stack.addWidget(self._build_behavior_page())
+        self.stack.addWidget(self._build_paste_text_page())
         self.stack.addWidget(self._build_glossary_page())
+        self.stack.addWidget(self._build_memory_page())
         self.stack.addWidget(self._build_persona_page())
         self.stack.addWidget(self._build_diagnostics_page())
         content_layout.addWidget(self.stack, stretch=1)
@@ -438,7 +480,11 @@ class ControlUI(QMainWindow):
         self.history_search = QLineEdit()
         self.history_search.setPlaceholderText("搜索转写内容、引擎或模型")
         self.history_search.setClearButtonEnabled(True)
-        self.history_search.textChanged.connect(self.refresh_history)
+        self.history_search_timer = QTimer(self)
+        self.history_search_timer.setSingleShot(True)
+        self.history_search_timer.setInterval(250)
+        self.history_search_timer.timeout.connect(self.refresh_history)
+        self.history_search.textChanged.connect(self.schedule_history_search)
         toolbar.addWidget(self.history_search, stretch=1)
 
         refresh_button = self._button(
@@ -466,21 +512,70 @@ class ControlUI(QMainWindow):
         toolbar.addWidget(delete_button)
         layout.addLayout(toolbar)
 
+        hint_row = QHBoxLayout()
         hint = QLabel("历史文字始终保存；只有开启录音归档后才会保留音频文件。")
         hint.setObjectName("pageHint")
-        layout.addWidget(hint)
+        hint_row.addWidget(hint)
+        hint_row.addStretch()
+        retention_label = QLabel("自动清理")
+        retention_label.setObjectName("pageHint")
+        hint_row.addWidget(retention_label)
+        self.history_retention_combo = QComboBox()
+        self.history_retention_combo.addItem("保留 1 天", 1)
+        self.history_retention_combo.addItem("保留 3 天", 3)
+        self.history_retention_combo.addItem("保留 7 天", 7)
+        self.history_retention_combo.addItem("保留 30 天", 30)
+        self.history_retention_combo.addItem("永久保留", 0)
+        self.history_retention_combo.setMaximumWidth(140)
+        self.history_retention_combo.currentIndexChanged.connect(
+            self.save_history_retention
+        )
+        hint_row.addWidget(self.history_retention_combo)
+        layout.addLayout(hint_row)
 
         self.history_table = self._table(
             ["ID", "时间", "转写内容", "服务", "模型", "录音", "识别", "状态"]
         )
         self.history_table.setColumnHidden(0, True)
+        self.history_table.setWordWrap(False)
         history_header = self.history_table.horizontalHeader()
-        history_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        history_header.setSectionResizeMode(2, QHeaderView.Stretch)
-        for column in range(3, 8):
-            history_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        history_header.setMinimumSectionSize(64)
+        history_header.setSectionResizeMode(QHeaderView.Interactive)
+        for column, width in {
+            1: 112,
+            2: 360,
+            3: 150,
+            4: 210,
+            5: 76,
+            6: 76,
+            7: 70,
+        }.items():
+            self.history_table.setColumnWidth(column, width)
         self.history_table.doubleClicked.connect(self.copy_selected_history)
         layout.addWidget(self.history_table, stretch=1)
+
+        pagination = QHBoxLayout()
+        pagination.addStretch()
+        self.history_previous_button = self._button(
+            "上一页",
+            QStyle.SP_ArrowLeft,
+            "secondary",
+        )
+        self.history_previous_button.clicked.connect(self.previous_history_page)
+        pagination.addWidget(self.history_previous_button)
+        self.history_page_label = QLabel("第 1 页")
+        self.history_page_label.setObjectName("pageHint")
+        self.history_page_label.setMinimumWidth(150)
+        self.history_page_label.setAlignment(Qt.AlignCenter)
+        pagination.addWidget(self.history_page_label)
+        self.history_next_button = self._button(
+            "下一页",
+            QStyle.SP_ArrowRight,
+            "secondary",
+        )
+        self.history_next_button.clicked.connect(self.next_history_page)
+        pagination.addWidget(self.history_next_button)
+        layout.addLayout(pagination)
         return page
 
     def _build_engines_page(self) -> QWidget:
@@ -558,8 +653,8 @@ class ControlUI(QMainWindow):
         layout.setSpacing(14)
 
         hotkey_panel = self._section_panel(
-            "输入方式",
-            "控制录音触发方式、文字粘贴和失败重试。",
+            "听写快捷键",
+            "控制普通语音听写的触发方式、录音保存和失败重试。",
         )
         form = QFormLayout()
         form.setHorizontalSpacing(22)
@@ -567,19 +662,17 @@ class ControlUI(QMainWindow):
 
         self.hotkey_input = QLineEdit()
         self.hotkey_input.setPlaceholderText("alt_r")
+        self.hotkey_input.setMaximumWidth(280)
         form.addRow("触发按键", self.hotkey_input)
 
         self.hotkey_mode_combo = QComboBox()
+        self.hotkey_mode_combo.setMaximumWidth(320)
         self.hotkey_mode_combo.addItem("按住说话，松开转写", "hold")
         self.hotkey_mode_combo.addItem("按一次开始，再按一次结束", "toggle")
         form.addRow("触发模式", self.hotkey_mode_combo)
 
-        self.paste_combo = QComboBox()
-        self.paste_combo.addItem("Ctrl+V", "ctrl+v")
-        self.paste_combo.addItem("Ctrl+Shift+V", "ctrl+shift+v")
-        form.addRow("粘贴快捷键", self.paste_combo)
-
         self.archive_combo = QComboBox()
+        self.archive_combo.setMaximumWidth(320)
         self.archive_combo.addItem("不保存录音，仅保存文字历史", "off")
         self.archive_combo.addItem("保存全部录音和文字", "all")
         form.addRow("录音归档", self.archive_combo)
@@ -587,44 +680,38 @@ class ControlUI(QMainWindow):
         self.retry_spin = QSpinBox()
         self.retry_spin.setRange(0, 10)
         self.retry_spin.setSuffix(" 次")
-        form.addRow("失败自动重试", self.retry_spin)
+        form.addRow("失败自动重试", self._spin_control(self.retry_spin, 120))
+        hotkey_panel.layout().addLayout(form)
+        layout.addWidget(hotkey_panel)
 
+        translation_panel = self._section_panel(
+            "实时翻译",
+            "单独设置翻译目标语言和苹果键盘上的翻译触发键。",
+        )
+        translation_form = QFormLayout()
+        translation_form.setHorizontalSpacing(22)
+        translation_form.setVerticalSpacing(12)
         self.translation_language_combo = QComboBox()
+        self.translation_language_combo.setMaximumWidth(220)
         for label, value in TRANSLATION_LANGUAGES:
             self.translation_language_combo.addItem(label, value)
-        form.addRow("翻译目标语言", self.translation_language_combo)
+        translation_form.addRow("目标语言", self.translation_language_combo)
 
         self.translation_hotkey_input = QLineEdit()
         self.translation_hotkey_input.setPlaceholderText("cmd_r")
-        form.addRow("翻译快捷键", self.translation_hotkey_input)
+        self.translation_hotkey_input.setMaximumWidth(280)
+        translation_form.addRow("翻译快捷键", self.translation_hotkey_input)
 
         self.translation_hotkey_mode_combo = QComboBox()
+        self.translation_hotkey_mode_combo.setMaximumWidth(320)
         self.translation_hotkey_mode_combo.addItem("按住说话，松开翻译", "hold")
         self.translation_hotkey_mode_combo.addItem(
             "按一次开始，再按一次结束并翻译",
             "toggle",
         )
-        form.addRow("翻译触发模式", self.translation_hotkey_mode_combo)
-        hotkey_panel.layout().addLayout(form)
-        layout.addWidget(hotkey_panel)
-
-        text_panel = self._section_panel(
-            "文字处理",
-            "识别完成后进行轻量处理，不额外调用模型。",
-        )
-        options_layout = QHBoxLayout()
-        options_layout.setSpacing(18)
-        self.clean_fillers_check = QCheckBox("清理口头禅和短重复")
-        self.simplified_check = QCheckBox("繁体转简体")
-        self.add_symbol_check = QCheckBox("补充标点")
-        self.optimize_check = QCheckBox("优化识别结果")
-        options_layout.addWidget(self.clean_fillers_check)
-        options_layout.addWidget(self.simplified_check)
-        options_layout.addWidget(self.add_symbol_check)
-        options_layout.addWidget(self.optimize_check)
-        options_layout.addStretch()
-        text_panel.layout().addLayout(options_layout)
-        layout.addWidget(text_panel)
+        translation_form.addRow("触发模式", self.translation_hotkey_mode_combo)
+        translation_panel.layout().addLayout(translation_form)
+        layout.addWidget(translation_panel)
 
         actions = QHBoxLayout()
         actions.addStretch()
@@ -639,11 +726,164 @@ class ControlUI(QMainWindow):
         layout.addStretch()
         return page
 
+    def _build_paste_text_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        paste_panel = self._section_panel(
+            "智能粘贴",
+            "自动区分普通应用和 Linux 终端，避免 CLI 把 Ctrl+V 当成图片输入。",
+        )
+        paste_form = QFormLayout()
+        paste_form.setHorizontalSpacing(22)
+        paste_form.setVerticalSpacing(12)
+
+        self.paste_combo = QComboBox()
+        self.paste_combo.setMaximumWidth(340)
+        self.paste_combo.addItem("智能识别（推荐）", "auto")
+        self.paste_combo.addItem("普通应用 · Ctrl+V", "ctrl+v")
+        self.paste_combo.addItem("Linux 终端 · Ctrl+Shift+V", "ctrl+shift+v")
+        self.paste_combo.addItem("兼容模式 · Shift+Insert", "shift+insert")
+        paste_form.addRow("粘贴模式", self.paste_combo)
+
+        self.paste_delay_spin = QSpinBox()
+        self.paste_delay_spin.setRange(0, 1000)
+        self.paste_delay_spin.setSingleStep(20)
+        self.paste_delay_spin.setSuffix(" 毫秒")
+        paste_form.addRow(
+            "剪贴板等待",
+            self._spin_control(self.paste_delay_spin, 140),
+        )
+
+        self.terminal_hints_input = QLineEdit()
+        self.terminal_hints_input.setMaximumWidth(420)
+        self.terminal_hints_input.setPlaceholderText(
+            "可选，例如 grok cli, qute cli"
+        )
+        paste_form.addRow("终端识别关键词", self.terminal_hints_input)
+        paste_panel.layout().addLayout(paste_form)
+        layout.addWidget(paste_panel)
+
+        terminal_panel = self._section_panel(
+            "终端模式",
+            "开启后，普通录音期间按一次模式键，本次结果按终端规则处理。",
+        )
+        terminal_form = QFormLayout()
+        terminal_form.setHorizontalSpacing(22)
+        terminal_form.setVerticalSpacing(12)
+
+        self.terminal_mode_enabled_check = QCheckBox(
+            "允许在普通听写录音中切换终端模式"
+        )
+        terminal_form.addRow("功能开关", self.terminal_mode_enabled_check)
+
+        self.terminal_mode_key_combo = QComboBox()
+        self.terminal_mode_key_combo.setEditable(True)
+        self.terminal_mode_key_combo.setMaximumWidth(160)
+        for label, value in (
+            ("M", "m"),
+            (">", ">"),
+            ("<", "<"),
+            ("/", "/"),
+            (";", ";"),
+            ("F8", "f8"),
+        ):
+            self.terminal_mode_key_combo.addItem(label, value)
+        self.terminal_mode_key_combo.lineEdit().setMaxLength(16)
+        terminal_form.addRow("模式键", self.terminal_mode_key_combo)
+        terminal_panel.layout().addLayout(terminal_form)
+        layout.addWidget(terminal_panel)
+
+        text_panel = self._section_panel(
+            "本地文字处理",
+            "全部在本机完成，不调用语言模型，不增加 API 成本。",
+        )
+        text_form = QFormLayout()
+        text_form.setHorizontalSpacing(22)
+        text_form.setVerticalSpacing(12)
+
+        self.chinese_conversion_combo = QComboBox()
+        self.chinese_conversion_combo.setMaximumWidth(240)
+        self.chinese_conversion_combo.addItem("保持识别原文", "none")
+        self.chinese_conversion_combo.addItem("繁体转简体", "t2s")
+        self.chinese_conversion_combo.addItem("简体转繁体", "s2t")
+        text_form.addRow("中文转换", self.chinese_conversion_combo)
+
+        text_options = QHBoxLayout()
+        text_options.setSpacing(20)
+        self.clean_fillers_check = QCheckBox("清理口头禅和短重复")
+        self.normalize_text_check = QCheckBox("规范空格和重复标点")
+        self.sentence_ending_check = QCheckBox("自动补充句末标点")
+        text_options.addWidget(self.clean_fillers_check)
+        text_options.addWidget(self.normalize_text_check)
+        text_options.addWidget(self.sentence_ending_check)
+        text_options.addStretch()
+        text_form.addRow("清理规则", text_options)
+        text_panel.layout().addLayout(text_form)
+        layout.addWidget(text_panel)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        save_button = self._button(
+            "保存并重启",
+            QStyle.SP_DialogSaveButton,
+            "primary",
+        )
+        save_button.clicked.connect(self.save_paste_text_settings)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+        layout.addStretch()
+        return page
+
     def _build_glossary_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
+
+        correction_panel = self._section_panel(
+            "AI 语音纠错",
+            "词库替换后调用轻量模型，只处理识别错误；失败时自动保留本地结果。",
+        )
+        correction_form = QFormLayout()
+        correction_form.setHorizontalSpacing(22)
+        correction_form.setVerticalSpacing(12)
+
+        self.ai_correction_enabled_check = QCheckBox(
+            "开启独立纠错，不启用人设改写"
+        )
+        correction_form.addRow("功能状态", self.ai_correction_enabled_check)
+
+        correction_options = QHBoxLayout()
+        correction_options.setSpacing(12)
+        self.ai_correction_level_combo = QComboBox()
+        self.ai_correction_level_combo.setMaximumWidth(180)
+        for value, label in CORRECTION_LEVEL_LABELS.items():
+            self.ai_correction_level_combo.addItem(label, value)
+        correction_options.addWidget(self.ai_correction_level_combo)
+
+        self.ai_correction_model_combo = QComboBox()
+        self.ai_correction_model_combo.setMaximumWidth(260)
+        for label, value in QWEN_REWRITE_MODELS:
+            self.ai_correction_model_combo.addItem(label, value)
+        correction_options.addWidget(self.ai_correction_model_combo)
+        correction_options.addStretch()
+        correction_form.addRow("强度与模型", correction_options)
+        correction_panel.layout().addLayout(correction_form)
+
+        correction_actions = QHBoxLayout()
+        correction_actions.addStretch()
+        save_correction_button = self._button(
+            "保存并重启",
+            QStyle.SP_DialogSaveButton,
+            "primary",
+        )
+        save_correction_button.clicked.connect(self.save_correction_settings)
+        correction_actions.addWidget(save_correction_button)
+        correction_panel.layout().addLayout(correction_actions)
+        layout.addWidget(correction_panel)
 
         editor_panel = self._section_panel(
             "常用词与自动纠错",
@@ -804,7 +1044,10 @@ class ControlUI(QMainWindow):
         self.persona_max_tokens_spin.setRange(64, 4096)
         self.persona_max_tokens_spin.setSingleStep(64)
         self.persona_max_tokens_spin.setSuffix(" Token")
-        provider_form.addRow("最大输出", self.persona_max_tokens_spin)
+        provider_form.addRow(
+            "最大输出",
+            self._spin_control(self.persona_max_tokens_spin, 150),
+        )
         provider_panel.layout().addLayout(provider_form)
 
         provider_actions = QHBoxLayout()
@@ -922,6 +1165,91 @@ class ControlUI(QMainWindow):
         page.setWidget(content)
         return page
 
+    def _build_memory_page(self) -> QWidget:
+        page = QScrollArea()
+        page.setObjectName("memoryScroll")
+        page.setWidgetResizable(True)
+        page.setFrameShape(QFrame.NoFrame)
+        page.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        status_panel = self._section_panel(
+            "轻量个人记忆",
+            "资料保存在本机 Markdown 文件中，只在快捷回复和人设改写时读取。",
+        )
+        status_form = QFormLayout()
+        status_form.setHorizontalSpacing(22)
+        status_form.setVerticalSpacing(12)
+        self.memory_enabled_check = QCheckBox("改写时参考个人资料")
+        status_form.addRow("功能状态", self.memory_enabled_check)
+        self.memory_max_chars_spin = QSpinBox()
+        self.memory_max_chars_spin.setRange(500, 12000)
+        self.memory_max_chars_spin.setSingleStep(500)
+        self.memory_max_chars_spin.setSuffix(" 字符")
+        status_form.addRow(
+            "单次读取上限",
+            self._spin_control(self.memory_max_chars_spin, 140),
+        )
+        status_panel.layout().addLayout(status_form)
+        layout.addWidget(status_panel)
+
+        style_panel = self._section_panel(
+            "表达风格",
+            "保持你惯用的语气、格式和措辞。",
+        )
+        self.memory_style_input = QPlainTextEdit()
+        self.memory_style_input.setObjectName("memoryTextEdit")
+        self.memory_style_input.setMinimumHeight(150)
+        style_panel.layout().addWidget(self.memory_style_input)
+        layout.addWidget(style_panel)
+
+        replies_panel = self._section_panel(
+            "固定回复",
+            "使用 Markdown 标题分组；语音说“快捷回复 + 分组名”可直接输入第一条。",
+        )
+        self.memory_replies_input = QPlainTextEdit()
+        self.memory_replies_input.setObjectName("memoryTextEdit")
+        self.memory_replies_input.setMinimumHeight(210)
+        replies_panel.layout().addWidget(self.memory_replies_input)
+        layout.addWidget(replies_panel)
+
+        knowledge_panel = self._section_panel(
+            "知识文件",
+            "按关键词选取相关 Markdown，不使用向量数据库或后台索引。",
+        )
+        knowledge_row = QHBoxLayout()
+        self.memory_knowledge_label = QLabel()
+        self.memory_knowledge_label.setObjectName("pageHint")
+        knowledge_row.addWidget(self.memory_knowledge_label)
+        knowledge_row.addStretch()
+        open_button = self._button(
+            "打开资料目录",
+            QStyle.SP_DirOpenIcon,
+            "secondary",
+        )
+        open_button.clicked.connect(self.open_memory_directory)
+        knowledge_row.addWidget(open_button)
+        knowledge_panel.layout().addLayout(knowledge_row)
+        layout.addWidget(knowledge_panel)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        save_button = self._button(
+            "保存并重启",
+            QStyle.SP_DialogSaveButton,
+            "primary",
+        )
+        save_button.clicked.connect(self.save_memory_settings)
+        actions.addWidget(save_button)
+        layout.addLayout(actions)
+        layout.addStretch()
+        page.setWidget(content)
+        return page
+
     def _build_diagnostics_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1001,6 +1329,33 @@ class ControlUI(QMainWindow):
         panel_layout.addWidget(title_label)
         panel_layout.addWidget(detail_label)
         return panel
+
+    def _spin_control(self, spin: QSpinBox, width: int) -> QWidget:
+        wrapper = QWidget()
+        wrapper.setMaximumWidth(width + 76)
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedWidth(width)
+        layout.addWidget(spin)
+
+        for tooltip, icon, callback in (
+            ("减小", QStyle.SP_ArrowDown, spin.stepDown),
+            ("增大", QStyle.SP_ArrowUp, spin.stepUp),
+        ):
+            button = QToolButton()
+            button.setObjectName("spinStepButton")
+            button.setIcon(self.style().standardIcon(icon))
+            button.setToolTip(tooltip)
+            button.setAutoRepeat(True)
+            button.setFixedSize(32, 36)
+            button.clicked.connect(
+                lambda _checked=False, action=callback: action()
+            )
+            layout.addWidget(button)
+        return wrapper
 
     def _diagnostic_card(self, title: str) -> tuple[QFrame, QLabel]:
         card = QFrame()
@@ -1273,6 +1628,19 @@ class ControlUI(QMainWindow):
                 border: 1px solid #2b8b58;
                 background: #ffffff;
             }
+            QToolButton#spinStepButton {
+                background: #ffffff;
+                border: 1px solid #c6d0c8;
+                border-radius: 6px;
+                padding: 5px;
+            }
+            QToolButton#spinStepButton:hover {
+                background: #e8f2eb;
+                border-color: #72a987;
+            }
+            QToolButton#spinStepButton:pressed {
+                background: #d9eadf;
+            }
             QComboBox::drop-down {
                 border: none;
                 width: 26px;
@@ -1381,17 +1749,18 @@ class ControlUI(QMainWindow):
         self.page_title.setText(self.PAGE_TITLES[index])
         if index == 1:
             self.refresh_history()
-        elif index == 4:
-            self.refresh_glossary()
         elif index == 5:
-            self.refresh_personas()
+            self.refresh_glossary()
         elif index == 6:
+            self.refresh_personas()
+        elif index == 7:
             self.refresh_diagnostics()
 
     def refresh_all(self) -> None:
         self.refresh_status()
         self.refresh_metrics()
         self.refresh_history()
+        self.refresh_recent_history()
         self.refresh_glossary()
         self.refresh_personas()
         self.refresh_diagnostics()
@@ -1399,8 +1768,9 @@ class ControlUI(QMainWindow):
 
     def refresh_passive_data(self) -> None:
         self.refresh_metrics()
-        self.refresh_history()
-        self.refresh_logs()
+        self.refresh_recent_history()
+        if self.stack.currentIndex() == 7:
+            self.refresh_logs()
 
     def refresh_status(self) -> None:
         self._running = self.service.is_running()
@@ -1495,32 +1865,75 @@ class ControlUI(QMainWindow):
         )
         self.duration_metric.set_value(format_duration(float(stats["duration"])))
 
-    def refresh_history(self) -> None:
+    def schedule_history_search(self, *_args: object) -> None:
+        self._history_page = 0
+        self.history_search_timer.start()
+
+    def previous_history_page(self) -> None:
+        if self._history_page <= 0:
+            return
+        self._history_page -= 1
+        self.refresh_history()
+
+    def next_history_page(self) -> None:
+        query = self.history_search.text().strip()
+        total = self.history.count(query)
+        if (self._history_page + 1) * self.HISTORY_PAGE_SIZE >= total:
+            return
+        self._history_page += 1
+        self.refresh_history()
+
+    def refresh_history(self, *_args: object) -> None:
         query = self.history_search.text() if hasattr(self, "history_search") else ""
-        records = self.history.recent(250, query)
+        total = self.history.count(query)
+        max_page = max(0, (total - 1) // self.HISTORY_PAGE_SIZE)
+        self._history_page = min(self._history_page, max_page)
+        records = self.history.recent(
+            self.HISTORY_PAGE_SIZE,
+            query,
+            offset=self._history_page * self.HISTORY_PAGE_SIZE,
+        )
         self._history_rows = records
 
-        self.history_table.setSortingEnabled(False)
-        self.history_table.setRowCount(len(records))
-        for row, record in enumerate(records):
-            values = [
-                str(record.id),
-                format_time(record.created_at),
-                record.text or record.error or "识别失败",
-                service_display(record.service),
-                record.model,
-                format_duration(record.duration_seconds),
-                format_duration(record.latency_seconds),
-                "成功" if record.status == "success" else "失败",
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column in {5, 6, 7}:
-                    item.setTextAlignment(Qt.AlignCenter)
-                if record.status != "success" and column in {2, 7}:
-                    item.setForeground(QBrush(QColor("#b43b38")))
-                self.history_table.setItem(row, column, item)
+        self.history_table.setUpdatesEnabled(False)
+        self.history_table.blockSignals(True)
+        try:
+            self.history_table.setSortingEnabled(False)
+            self.history_table.clearContents()
+            self.history_table.setRowCount(len(records))
+            for row, record in enumerate(records):
+                values = [
+                    str(record.id),
+                    format_time(record.created_at),
+                    record.text or record.error or "识别失败",
+                    service_display(record.service),
+                    record.model,
+                    format_duration(record.duration_seconds),
+                    format_duration(record.latency_seconds),
+                    "成功" if record.status == "success" else "失败",
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column in {5, 6, 7}:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if record.status != "success" and column in {2, 7}:
+                        item.setForeground(QBrush(QColor("#b43b38")))
+                    self.history_table.setItem(row, column, item)
+        finally:
+            self.history_table.blockSignals(False)
+            self.history_table.setUpdatesEnabled(True)
+            self.history_table.viewport().update()
 
+        page_count = max_page + 1 if total else 1
+        self.history_page_label.setText(
+            f"第 {self._history_page + 1} / {page_count} 页 · 共 {total} 条"
+        )
+        self.history_previous_button.setEnabled(self._history_page > 0)
+        self.history_next_button.setEnabled(
+            (self._history_page + 1) * self.HISTORY_PAGE_SIZE < total
+        )
+
+    def refresh_recent_history(self) -> None:
         recent = self.history.recent(5)
         self.recent_table.setRowCount(len(recent))
         for row, record in enumerate(recent):
@@ -1669,6 +2082,19 @@ class ControlUI(QMainWindow):
 
     def load_settings(self) -> None:
         env = self.env_store.read()
+        retention_days = self.env_store.get_int(
+            env,
+            "HISTORY_RETENTION_DAYS",
+            1,
+            minimum=0,
+            maximum=3650,
+        )
+        self.history_retention_combo.blockSignals(True)
+        retention_index = self.history_retention_combo.findData(retention_days)
+        self.history_retention_combo.setCurrentIndex(
+            retention_index if retention_index >= 0 else 0
+        )
+        self.history_retention_combo.blockSignals(False)
         set_combo_data(
             self.default_service_combo,
             env.get("TRANSCRIPTION_SERVICE", "aliyun"),
@@ -1695,7 +2121,6 @@ class ControlUI(QMainWindow):
             self.hotkey_mode_combo,
             env.get("TRANSCRIPTION_HOTKEY_MODE", "hold"),
         )
-        set_combo_data(self.paste_combo, env.get("PASTE_HOTKEY", "ctrl+v"))
         set_combo_data(self.archive_combo, env.get("AUDIO_ARCHIVE_MODE", "off"))
         self.retry_spin.setValue(
             self.env_store.get_int(
@@ -1717,18 +2142,83 @@ class ControlUI(QMainWindow):
             self.translation_hotkey_mode_combo,
             env.get("TRANSLATION_HOTKEY_MODE", "hold"),
         )
+        set_combo_data(self.paste_combo, env.get("PASTE_HOTKEY", "auto"))
+        self.paste_delay_spin.setValue(
+            self.env_store.get_int(
+                env,
+                "PASTE_DELAY_MS",
+                80,
+                minimum=0,
+                maximum=1000,
+            )
+        )
+        self.terminal_hints_input.setText(env.get("PASTE_TERMINAL_HINTS", ""))
+        self.terminal_mode_enabled_check.setChecked(
+            self.env_store.get_bool(env, "TERMINAL_MODE_ENABLED", False)
+        )
+        terminal_mode_key = env.get("TERMINAL_MODE_KEY", "m").strip().lower()
+        terminal_key_index = self.terminal_mode_key_combo.findData(
+            terminal_mode_key
+        )
+        if terminal_key_index >= 0:
+            self.terminal_mode_key_combo.setCurrentIndex(terminal_key_index)
+        else:
+            self.terminal_mode_key_combo.setEditText(terminal_mode_key)
+        conversion = env.get("CHINESE_CONVERSION", "").strip().lower()
+        if not conversion:
+            conversion = (
+                "t2s"
+                if self.env_store.get_bool(
+                    env,
+                    "CONVERT_TO_SIMPLIFIED",
+                    False,
+                )
+                else "none"
+            )
+        set_combo_data(self.chinese_conversion_combo, conversion)
         self.clean_fillers_check.setChecked(
-            self.env_store.get_bool(env, "CLEAN_ASR_FILLERS", False)
+            self.env_store.get_bool(env, "CLEAN_ASR_FILLERS", True)
         )
-        self.simplified_check.setChecked(
-            self.env_store.get_bool(env, "CONVERT_TO_SIMPLIFIED", False)
+        self.normalize_text_check.setChecked(
+            self.env_store.get_bool(env, "NORMALIZE_TRANSCRIPT_TEXT", True)
         )
-        self.add_symbol_check.setChecked(
-            self.env_store.get_bool(env, "ADD_SYMBOL", False)
+        self.sentence_ending_check.setChecked(
+            self.env_store.get_bool(env, "SMART_SENTENCE_ENDING", False)
         )
-        self.optimize_check.setChecked(
-            self.env_store.get_bool(env, "OPTIMIZE_RESULT", False)
+        self.ai_correction_enabled_check.setChecked(
+            self.env_store.get_bool(env, "AI_CORRECTION_ENABLED", False)
         )
+        set_combo_data(
+            self.ai_correction_level_combo,
+            {
+                "strict": "light",
+                "deep": "heavy",
+            }.get(
+                env.get("AI_CORRECTION_LEVEL", "light"),
+                env.get("AI_CORRECTION_LEVEL", "light"),
+            ),
+        )
+        set_combo_data(
+            self.ai_correction_model_combo,
+            env.get("AI_CORRECTION_MODEL", "qwen3.5-flash"),
+        )
+        self.memory_enabled_check.setChecked(
+            self.env_store.get_bool(env, "PERSONAL_MEMORY_ENABLED", True)
+        )
+        self.memory_max_chars_spin.setValue(
+            self.env_store.get_int(
+                env,
+                "PERSONAL_MEMORY_MAX_CHARS",
+                3200,
+                minimum=500,
+                maximum=12000,
+            )
+        )
+        self.memory_style_input.setPlainText(self.memory_store.load_style())
+        self.memory_replies_input.setPlainText(
+            self.memory_store.load_common_replies()
+        )
+        self.refresh_memory_summary()
         self.persona_enabled_check.setChecked(
             self.env_store.get_bool(env, "PERSONA_REWRITE_ENABLED", False)
         )
@@ -1800,7 +2290,6 @@ class ControlUI(QMainWindow):
             {
                 "TRANSCRIPTION_HOTKEY": self.hotkey_input.text().strip() or "alt_r",
                 "TRANSCRIPTION_HOTKEY_MODE": self.hotkey_mode_combo.currentData(),
-                "PASTE_HOTKEY": self.paste_combo.currentData(),
                 "AUDIO_ARCHIVE_MODE": self.archive_combo.currentData(),
                 "AUTO_RETRY_LIMIT": self.retry_spin.value(),
                 "TRANSLATION_SERVICE": "aliyun",
@@ -1808,13 +2297,75 @@ class ControlUI(QMainWindow):
                 "TRANSLATION_HOTKEY": self.translation_hotkey_input.text().strip()
                 or "cmd_r",
                 "TRANSLATION_HOTKEY_MODE": self.translation_hotkey_mode_combo.currentData(),
-                "CLEAN_ASR_FILLERS": str(self.clean_fillers_check.isChecked()).lower(),
-                "CONVERT_TO_SIMPLIFIED": str(self.simplified_check.isChecked()).lower(),
-                "ADD_SYMBOL": str(self.add_symbol_check.isChecked()).lower(),
-                "OPTIMIZE_RESULT": str(self.optimize_check.isChecked()).lower(),
             }
         )
-        self._restart_after_save("输入和文字设置已保存。")
+        self._restart_after_save("快捷键与翻译设置已保存。")
+
+    def save_history_retention(self, *_args: object) -> None:
+        retention_days = int(self.history_retention_combo.currentData())
+        self._history_retention_days = retention_days
+        self.env_store.update(
+            {
+                "HISTORY_RETENTION_DAYS": retention_days,
+                "HISTORY_MAX_RECORDS": self._history_max_records,
+            }
+        )
+        self.history.configure_retention(
+            retention_days=retention_days,
+            max_records=self._history_max_records,
+        )
+        self._history_page = 0
+        self.refresh_history()
+        self.refresh_recent_history()
+        self.refresh_metrics()
+
+    def save_paste_text_settings(self) -> None:
+        conversion = self.chinese_conversion_combo.currentData()
+        terminal_mode_key = (
+            self.terminal_mode_key_combo.currentText().strip().lower()
+        )
+        if self.terminal_mode_enabled_check.isChecked() and not terminal_mode_key:
+            QMessageBox.warning(
+                self,
+                "终端模式键不能为空",
+                "请为终端模式选择或输入一个按键。",
+            )
+            return
+        if terminal_mode_key in {
+            self.hotkey_input.text().strip().lower(),
+            self.translation_hotkey_input.text().strip().lower(),
+        }:
+            QMessageBox.warning(
+                self,
+                "快捷键冲突",
+                "终端模式键不能与听写或翻译快捷键相同。",
+            )
+            return
+        self.env_store.update(
+            {
+                "PASTE_HOTKEY": self.paste_combo.currentData(),
+                "PASTE_DELAY_MS": self.paste_delay_spin.value(),
+                "PASTE_TERMINAL_HINTS": self.terminal_hints_input.text().strip(),
+                "TERMINAL_MODE_ENABLED": str(
+                    self.terminal_mode_enabled_check.isChecked()
+                ).lower(),
+                "TERMINAL_MODE_KEY": terminal_mode_key or "m",
+                "CHINESE_CONVERSION": conversion,
+                "CONVERT_TO_SIMPLIFIED": str(conversion == "t2s").lower(),
+                "CLEAN_ASR_FILLERS": str(
+                    self.clean_fillers_check.isChecked()
+                ).lower(),
+                "NORMALIZE_TRANSCRIPT_TEXT": str(
+                    self.normalize_text_check.isChecked()
+                ).lower(),
+                "SMART_SENTENCE_ENDING": str(
+                    self.sentence_ending_check.isChecked()
+                ).lower(),
+                "ADD_SYMBOL": "false",
+                "OPTIMIZE_RESULT": "false",
+            }
+        )
+        self._restart_after_save("粘贴与文本设置已保存。")
 
     def save_persona_settings(self) -> None:
         active_id = self.active_persona_combo.currentData()
@@ -1840,6 +2391,48 @@ class ControlUI(QMainWindow):
             }
         )
         self._restart_after_save("人设与改写配置已保存。")
+
+    def save_correction_settings(self) -> None:
+        self.env_store.update(
+            {
+                "AI_CORRECTION_ENABLED": str(
+                    self.ai_correction_enabled_check.isChecked()
+                ).lower(),
+                "AI_CORRECTION_LEVEL": self.ai_correction_level_combo.currentData(),
+                "AI_CORRECTION_MODEL": self.ai_correction_model_combo.currentData(),
+                "AI_CORRECTION_TIMEOUT_SECONDS": "20",
+                "AI_CORRECTION_MAX_TOKENS": "1000",
+            }
+        )
+        self._restart_after_save("AI 纠错配置已保存。")
+
+    def refresh_memory_summary(self) -> None:
+        files = self.memory_store.knowledge_files()
+        self.memory_knowledge_label.setText(
+            f"{len(files)} 个知识文件 · {self.memory_store.knowledge_dir}"
+        )
+
+    def open_memory_directory(self) -> None:
+        self.memory_store.knowledge_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self.memory_store.root.resolve()))
+        )
+
+    def save_memory_settings(self) -> None:
+        self.memory_store.save_style(self.memory_style_input.toPlainText())
+        self.memory_store.save_common_replies(
+            self.memory_replies_input.toPlainText()
+        )
+        self.env_store.update(
+            {
+                "PERSONAL_MEMORY_ENABLED": str(
+                    self.memory_enabled_check.isChecked()
+                ).lower(),
+                "PERSONAL_MEMORY_MAX_CHARS": self.memory_max_chars_spin.value(),
+            }
+        )
+        self.refresh_memory_summary()
+        self._restart_after_save("个人资料库已保存。")
 
     def _restart_after_save(self, message: str) -> None:
         if self.service.is_running():
@@ -2200,8 +2793,8 @@ print(error or text)
 
 if __name__ == "__main__":
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
-    app = QApplication([])
-    app.setApplicationName(APP_NAME)
+    app = QApplication([APP_ID, *sys.argv[1:]])
+    configure_qt_application(app)
     window = ControlUI()
     window.show()
     app.exec_()

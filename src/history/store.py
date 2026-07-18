@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Optional
 
 
@@ -26,10 +27,20 @@ class TranscriptionRecord:
 
 
 class HistoryStore:
-    def __init__(self, path: Path | str = "data/history.db") -> None:
+    def __init__(
+        self,
+        path: Path | str = "data/history.db",
+        *,
+        retention_days: int | None = None,
+        max_records: int | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.retention_days = self._positive_or_zero(retention_days)
+        self.max_records = self._positive_or_zero(max_records)
+        self._last_cleanup_at = 0.0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self.maybe_cleanup(force=True)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -152,22 +163,93 @@ class HistoryStore:
                     max(1, attempt),
                 ),
             )
-            return int(cursor.lastrowid)
+            record_id = int(cursor.lastrowid)
+        self.maybe_cleanup()
+        return record_id
 
-    def recent(self, limit: int = 100, query: str = "") -> list[TranscriptionRecord]:
+    def recent(
+        self,
+        limit: int = 100,
+        query: str = "",
+        *,
+        offset: int = 0,
+    ) -> list[TranscriptionRecord]:
         limit = max(1, min(1000, limit))
-        sql = "SELECT * FROM transcriptions"
-        parameters: list[object] = []
-        if query.strip():
-            sql += " WHERE text LIKE ? OR service LIKE ? OR model LIKE ?"
-            pattern = f"%{query.strip()}%"
-            parameters.extend([pattern, pattern, pattern])
-        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
-        parameters.append(limit)
+        offset = max(0, offset)
+        where_sql, parameters = self._search_clause(query)
+        sql = (
+            f"SELECT * FROM transcriptions{where_sql} "
+            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
+        parameters.extend([limit, offset])
 
         with self._connect() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [TranscriptionRecord(**dict(row)) for row in rows]
+
+    def count(self, query: str = "") -> int:
+        where_sql, parameters = self._search_clause(query)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) AS total FROM transcriptions{where_sql}",
+                parameters,
+            ).fetchone()
+        return int(row["total"] or 0)
+
+    def configure_retention(
+        self,
+        *,
+        retention_days: int | None,
+        max_records: int | None,
+    ) -> int:
+        self.retention_days = self._positive_or_zero(retention_days)
+        self.max_records = self._positive_or_zero(max_records)
+        return self.maybe_cleanup(force=True)
+
+    def maybe_cleanup(self, *, force: bool = False) -> int:
+        if not self.retention_days and not self.max_records:
+            return 0
+        now = monotonic()
+        if not force and now - self._last_cleanup_at < 24 * 60 * 60:
+            return 0
+        self._last_cleanup_at = now
+        return self.cleanup(
+            retention_days=self.retention_days,
+            max_records=self.max_records,
+        )
+
+    def cleanup(
+        self,
+        *,
+        retention_days: int | None = None,
+        max_records: int | None = None,
+    ) -> int:
+        retention_days = self._positive_or_zero(retention_days)
+        max_records = self._positive_or_zero(max_records)
+        with self._connect() as connection:
+            before = connection.total_changes
+            if retention_days:
+                cutoff = (
+                    datetime.now().astimezone() - timedelta(days=retention_days)
+                ).isoformat(timespec="seconds")
+                connection.execute(
+                    "DELETE FROM transcriptions WHERE created_at < ?",
+                    (cutoff,),
+                )
+            if max_records:
+                connection.execute(
+                    """
+                    DELETE FROM transcriptions
+                    WHERE id NOT IN (
+                        SELECT id
+                        FROM transcriptions
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT ?
+                    )
+                    """,
+                    (max_records,),
+                )
+            return connection.total_changes - before
 
     def stats_today(self) -> dict[str, float | int]:
         with self._connect() as connection:
@@ -202,3 +284,22 @@ class HistoryStore:
     def clear(self) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM transcriptions")
+
+    @staticmethod
+    def _positive_or_zero(value: int | None) -> int:
+        if value is None:
+            return 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _search_clause(query: str) -> tuple[str, list[object]]:
+        if not query.strip():
+            return "", []
+        pattern = f"%{query.strip()}%"
+        return (
+            " WHERE text LIKE ? OR service LIKE ? OR model LIKE ?",
+            [pattern, pattern, pattern],
+        )

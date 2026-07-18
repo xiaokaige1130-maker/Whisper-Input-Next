@@ -15,6 +15,7 @@ load_dotenv()
 
 from src.audio.recorder import AudioRecorder
 from src.audio.archive import AudioArchiveManager
+from src.correction import CORRECTION_LEVEL_LABELS, CorrectionProcessor
 from src.keyboard.listener import KeyboardManager, check_accessibility_permissions
 from src.keyboard.inputState import InputState
 from src.transcription.whisper import WhisperProcessor
@@ -26,7 +27,9 @@ from src.ui.floating_preview import FloatingPreviewWindow
 from src.glossary import GlossaryProcessor
 from src.history.store import HistoryStore
 from src.llm.translate import TranslateProcessor
+from src.memory import PersonalMemoryStore
 from src.persona import PROVIDER_LABELS, PersonaProcessor
+from src.terminal_mode import TerminalTextProcessor
 
 # 版本信息
 __version__ = "3.3.0"
@@ -62,17 +65,48 @@ class VoiceAssistant:
     def __init__(self, openai_processor, local_processor, doubao_processor):
         self.audio_recorder = AudioRecorder()
         self.audio_archive = AudioArchiveManager()
-        self.history_store = HistoryStore()
+        try:
+            history_retention_days = max(
+                0,
+                int(os.getenv("HISTORY_RETENTION_DAYS", "1")),
+            )
+        except ValueError:
+            history_retention_days = 1
+        try:
+            history_max_records = max(
+                0,
+                int(os.getenv("HISTORY_MAX_RECORDS", "5000")),
+            )
+        except ValueError:
+            history_max_records = 5000
+        self.history_store = HistoryStore(
+            retention_days=history_retention_days,
+            max_records=history_max_records,
+        )
         self.openai_processor = openai_processor  # OpenAI GPT-4o transcribe
         self.local_processor = local_processor    # 本地 whisper
         self.doubao_processor = doubao_processor  # 豆包流式 ASR
         self.translate_processor = TranslateProcessor()
         self.glossary_processor = GlossaryProcessor()
-        self.persona_processor = PersonaProcessor()
+        self.correction_processor = CorrectionProcessor(
+            self.glossary_processor.store
+        )
+        self.memory_store = PersonalMemoryStore()
+        self.persona_processor = PersonaProcessor(memory_store=self.memory_store)
+        self.terminal_processor = TerminalTextProcessor()
         logger.info(
             "词库与纠错已启用: %d 条规则",
             self.glossary_processor.store.enabled_count(),
         )
+        if self.correction_processor.enabled:
+            if self.correction_processor.is_available():
+                logger.info(
+                    "AI 纠错已启用: %s / %s",
+                    CORRECTION_LEVEL_LABELS[self.correction_processor.level],
+                    self.correction_processor.model,
+                )
+            else:
+                logger.warning("AI 纠错已开启，但 DashScope API Key 未配置")
         if self.persona_processor.enabled:
             if self.persona_processor.is_enabled():
                 logger.info(
@@ -187,7 +221,10 @@ class VoiceAssistant:
             and self.doubao_processor.is_available()
         ):
             self.stop_doubao_streaming()
-        elif self._current_state == InputState.RECORDING:
+        elif self._current_state in {
+            InputState.RECORDING,
+            InputState.RECORDING_TERMINAL,
+        }:
             self.stop_openai_recording()
         elif self._current_state == InputState.RECORDING_TRANSLATE:
             self.stop_translation_recording()
@@ -276,13 +313,18 @@ class VoiceAssistant:
 
         buffer = io.BytesIO(job.audio_bytes)
         started_at = time.monotonic()
+        asr_mode = (
+            "transcriptions"
+            if job.mode in {"translations", "terminal"}
+            else job.mode
+        )
         try:
             if job.processor == "openai":
                 if self.openai_processor is None:
                     raise RuntimeError("OpenAI 转录服务未配置")
                 processor_result = self.openai_processor.process_audio(
                     buffer,
-                    mode="transcriptions" if job.mode == "translations" else job.mode,
+                    mode=asr_mode,
                     prompt="",
                     archive_path=job.archive_path,
                 )
@@ -291,7 +333,7 @@ class VoiceAssistant:
                     raise RuntimeError("本地 Whisper 不可用")
                 processor_result = self.local_processor.process_audio(
                     buffer,
-                    mode="transcriptions" if job.mode == "translations" else job.mode,
+                    mode=asr_mode,
                     prompt="",
                     archive_path=job.archive_path,
                 )
@@ -327,10 +369,26 @@ class VoiceAssistant:
             return
 
         text = self.glossary_processor.apply(text)
+        text = self.correction_processor.correct(text)
+        quick_reply = self.memory_store.resolve_quick_reply(text)
+        quick_reply_used = quick_reply != text
+        if quick_reply_used:
+            text = quick_reply
+            logger.info("已使用本地快捷回复: %s", text)
+        if job.mode == "terminal":
+            text = self.terminal_processor.process(text)
+            logger.info("终端模式结果: %s", text)
         latency_seconds = time.monotonic() - started_at
         service, model = self._get_job_cache_metadata(job)
-        history_mode = job.mode
-        if job.mode == "transcriptions" and self.persona_processor.enabled:
+        if self.correction_processor.enabled and not self.correction_processor.last_error:
+            service = f"{service}+correction-qwen"
+            model = f"{model} → {self.correction_processor.model}"
+        history_mode = "quick-reply" if quick_reply_used else job.mode
+        if (
+            job.mode == "transcriptions"
+            and not quick_reply_used
+            and self.persona_processor.enabled
+        ):
             persona = self.persona_processor.active_persona
             if persona is None:
                 logger.warning("人设改写已开启，但没有可用人设，将输入原文")
@@ -529,6 +587,11 @@ class VoiceAssistant:
 
     def stop_openai_recording(self):
         """停止录音并处理（批量转录模式）"""
+        job_mode = (
+            "terminal"
+            if self.keyboard_manager.consume_terminal_mode()
+            else "transcriptions"
+        )
         audio = self.audio_recorder.stop_recording()
         if audio == "TOO_SHORT":
             logger.warning("录音时长太短，状态将重置")
@@ -545,6 +608,7 @@ class VoiceAssistant:
         self._queue_job(
             audio_bytes,
             "openai",
+            mode=job_mode,
             archive_path=archive_path,
             max_retries=self.max_auto_retries,
             duration_seconds=self._audio_duration_seconds(audio_bytes),
@@ -679,12 +743,21 @@ class VoiceAssistant:
             """流式结束，一次性输入最终文本到目标应用"""
             if text:
                 text = self.glossary_processor.apply(text)
+                text = self.correction_processor.correct(text)
                 logger.info(f"[最终输入] {text}")
+                service = "doubao"
+                model = "bigmodel"
+                if (
+                    self.correction_processor.enabled
+                    and not self.correction_processor.last_error
+                ):
+                    service += "+correction-qwen"
+                    model += f" → {self.correction_processor.model}"
                 self._save_transcription_cache(
                     self._current_streaming_archive_path,
                     text,
-                    service="doubao",
-                    model="bigmodel",
+                    service=service,
+                    model=model,
                     mode="transcriptions",
                 )
                 if not self._streaming_history_recorded:
@@ -695,8 +768,8 @@ class VoiceAssistant:
                     )
                     self.history_store.add_success(
                         text=text,
-                        service="doubao",
-                        model="bigmodel",
+                        service=service,
+                        model=model,
                         mode="transcriptions",
                         duration_seconds=self._streaming_duration_seconds,
                         latency_seconds=latency_seconds,

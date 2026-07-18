@@ -22,6 +22,7 @@ Exec=$APP_DIR/launch-control-ui.sh
 Icon=$APP_DIR/assets/icons/whisper-input.png
 Terminal=false
 Categories=Utility;
+StartupWMClass=whisper-input-control
 StartupNotify=true
 EOF
 
@@ -33,6 +34,8 @@ Comment=登录后启动语音输入与翻译快捷键
 Exec=$APP_DIR/launch-service.sh
 Icon=$APP_DIR/assets/icons/whisper-input.png
 Terminal=false
+NoDisplay=true
+StartupNotify=false
 X-GNOME-Autostart-enabled=true
 EOF
 
