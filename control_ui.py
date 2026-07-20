@@ -39,6 +39,12 @@ from PyQt5.QtWidgets import (
 
 from src.agent import GlossarySuggestion, KnowledgeAgent
 from src.control import EnvStore, ServiceManager
+from src.control.ui_themes import (
+    DEFAULT_THEME,
+    THEME_OPTIONS,
+    build_stylesheet,
+    normalize_theme,
+)
 from src.correction import CORRECTION_LEVEL_LABELS
 from src.glossary import GlossaryEntry, GlossaryProcessor, GlossaryStore
 from src.history import HistoryStore, TranscriptionRecord
@@ -488,6 +494,7 @@ class ControlUI(QMainWindow):
         self.env_store = EnvStore(self.root / ".env")
         self.service = ServiceManager(self.root)
         initial_env = self.env_store.read()
+        self._ui_theme = normalize_theme(initial_env.get("UI_THEME", DEFAULT_THEME))
         self._history_retention_days = self.env_store.get_int(
             initial_env,
             "HISTORY_RETENTION_DAYS",
@@ -531,8 +538,9 @@ class ControlUI(QMainWindow):
         self._hotkey_capture_service_was_running = False
 
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(1080, 720)
-        self.resize(1240, 820)
+        # Compact window closer to macOS control UI proportions.
+        self.setMinimumSize(880, 600)
+        self.resize(980, 680)
         if APP_ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
 
@@ -564,11 +572,11 @@ class ControlUI(QMainWindow):
         content = QFrame()
         content.setObjectName("contentPanel")
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(30, 22, 30, 26)
-        content_layout.setSpacing(18)
+        content_layout.setContentsMargins(22, 16, 22, 18)
+        content_layout.setSpacing(12)
 
         topbar = QHBoxLayout()
-        topbar.setSpacing(12)
+        topbar.setSpacing(8)
         self.page_title = QLabel(self.PAGE_TITLES[0])
         self.page_title.setObjectName("pageTitle")
         topbar.addWidget(self.page_title)
@@ -578,8 +586,8 @@ class ControlUI(QMainWindow):
         self.status_chip.setObjectName("statusChip")
         self.status_chip.setProperty("state", "stopped")
         chip_layout = QHBoxLayout(self.status_chip)
-        chip_layout.setContentsMargins(12, 6, 12, 6)
-        chip_layout.setSpacing(7)
+        chip_layout.setContentsMargins(8, 4, 8, 4)
+        chip_layout.setSpacing(5)
         self.status_dot = QLabel("●")
         self.status_dot.setObjectName("statusDot")
         self.top_status_label = QLabel("未运行")
@@ -592,7 +600,7 @@ class ControlUI(QMainWindow):
         quick_restart.setObjectName("iconButton")
         quick_restart.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         quick_restart.setToolTip("重启语音输入服务")
-        quick_restart.setFixedSize(34, 34)
+        quick_restart.setFixedSize(28, 28)
         quick_restart.clicked.connect(self.restart_service)
         topbar.addWidget(quick_restart)
         content_layout.addLayout(topbar)
@@ -616,14 +624,15 @@ class ControlUI(QMainWindow):
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(224)
+        sidebar.setFixedWidth(188)
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(18, 24, 18, 20)
-        layout.setSpacing(18)
+        layout.setContentsMargins(12, 16, 12, 14)
+        layout.setSpacing(8)
 
         brand = QLabel(APP_NAME)
         brand.setObjectName("brandTitle")
-        brand_subtitle = QLabel("AI 语音输入工作台")
+        brand.setWordWrap(True)
+        brand_subtitle = QLabel("设置")
         brand_subtitle.setObjectName("brandSubtitle")
         layout.addWidget(brand)
         layout.addWidget(brand_subtitle)
@@ -632,6 +641,7 @@ class ControlUI(QMainWindow):
         self.nav.setObjectName("navigation")
         self.nav.setFocusPolicy(Qt.NoFocus)
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav.setSpacing(2)
         for title in self.PAGE_TITLES:
             item = QListWidgetItem(title)
             self.nav.addItem(item)
@@ -639,7 +649,7 @@ class ControlUI(QMainWindow):
         self.nav.currentRowChanged.connect(self.change_page)
         layout.addWidget(self.nav, stretch=1)
 
-        version_label = QLabel("XIAOKAIGE VOICE V4")
+        version_label = QLabel("Linux · v4")
         version_label.setObjectName("versionLabel")
         layout.addWidget(version_label)
         return sidebar
@@ -648,20 +658,21 @@ class ControlUI(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
+        layout.setSpacing(10)
 
         hero = QFrame()
         hero.setObjectName("heroPanel")
         hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(24, 22, 24, 22)
-        hero_layout.setSpacing(20)
+        hero_layout.setContentsMargins(14, 12, 14, 12)
+        hero_layout.setSpacing(12)
 
         hero_copy = QVBoxLayout()
-        hero_copy.setSpacing(5)
+        hero_copy.setSpacing(3)
         eyebrow = QLabel("VOICE SERVICE")
         eyebrow.setObjectName("eyebrow")
         self.hero_title = QLabel("正在检查服务")
         self.hero_title.setObjectName("heroTitle")
+        # Keep Linux wording — hotkeys differ from macOS.
         self.hero_detail = QLabel("正在读取当前识别引擎和快捷键配置。")
         self.hero_detail.setObjectName("heroDetail")
         self.hero_detail.setWordWrap(True)
@@ -687,8 +698,26 @@ class ControlUI(QMainWindow):
         hero_layout.addWidget(restart_button)
         layout.addWidget(hero)
 
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(8)
+        theme_label = QLabel("界面主题")
+        theme_label.setObjectName("configTitle")
+        self.theme_combo = QComboBox()
+        self.theme_combo.setMaximumWidth(220)
+        for label, value in THEME_OPTIONS:
+            self.theme_combo.addItem(label, value)
+        set_combo_data(self.theme_combo, self._ui_theme)
+        self.theme_combo.activated.connect(self._save_ui_theme)
+        theme_hint = QLabel("即时切换 · 不改快捷键与逻辑")
+        theme_hint.setObjectName("pageHint")
+        theme_row.addWidget(theme_label)
+        theme_row.addWidget(self.theme_combo)
+        theme_row.addWidget(theme_hint)
+        theme_row.addStretch()
+        layout.addLayout(theme_row)
+
         metrics = QHBoxLayout()
-        metrics.setSpacing(12)
+        metrics.setSpacing(8)
         self.today_metric = MetricCard("今日转写", "成功与失败任务")
         self.success_metric = MetricCard("成功率", "今日识别稳定性")
         self.latency_metric = MetricCard("平均耗时", "从录音结束到文字返回")
@@ -709,17 +738,24 @@ class ControlUI(QMainWindow):
         section_row.addStretch()
         layout.addLayout(section_row)
 
+        # Two rows of three — avoids six cramped columns on a smaller window.
         config_band = QFrame()
         config_band.setObjectName("configBand")
-        config_layout = QHBoxLayout(config_band)
-        config_layout.setContentsMargins(20, 15, 20, 15)
-        config_layout.setSpacing(12)
-        self.engine_value = self._config_value(config_layout, "识别引擎")
-        self.hotkey_value = self._config_value(config_layout, "听写快捷键")
-        self.microphone_value = self._config_value(config_layout, "麦克风")
-        self.translation_value = self._config_value(config_layout, "翻译模式")
-        self.persona_value = self._config_value(config_layout, "人设改写")
-        self.archive_value = self._config_value(config_layout, "录音保存")
+        config_grid = QVBoxLayout(config_band)
+        config_grid.setContentsMargins(12, 10, 12, 10)
+        config_grid.setSpacing(10)
+        config_row1 = QHBoxLayout()
+        config_row1.setSpacing(12)
+        config_row2 = QHBoxLayout()
+        config_row2.setSpacing(12)
+        self.engine_value = self._config_value(config_row1, "识别引擎")
+        self.hotkey_value = self._config_value(config_row1, "听写快捷键")
+        self.microphone_value = self._config_value(config_row1, "麦克风")
+        self.translation_value = self._config_value(config_row2, "翻译模式")
+        self.persona_value = self._config_value(config_row2, "人设改写")
+        self.archive_value = self._config_value(config_row2, "录音保存")
+        config_grid.addLayout(config_row1)
+        config_grid.addLayout(config_row2)
         layout.addWidget(config_band)
 
         recent_header = QHBoxLayout()
@@ -734,13 +770,13 @@ class ControlUI(QMainWindow):
         layout.addLayout(recent_header)
 
         self.recent_table = self._table(["时间", "内容", "引擎", "识别耗时"])
-        self.recent_table.setMaximumHeight(220)
+        self.recent_table.setMaximumHeight(180)
         header = self.recent_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        layout.addWidget(self.recent_table)
+        layout.addWidget(self.recent_table, stretch=1)
         return page
 
     def _build_history_page(self) -> QWidget:
@@ -2102,369 +2138,27 @@ class ControlUI(QMainWindow):
 
     def _apply_styles(self) -> None:
         self.setFont(QFont("Ubuntu Sans", 10))
-        self.setStyleSheet(
-            """
-            * {
-                font-family: "Ubuntu Sans", "Noto Sans CJK SC";
-                font-size: 14px;
-                color: #172019;
-            }
-            QMainWindow, QWidget#appRoot, QFrame#contentPanel {
-                background: #f3f5f2;
-            }
-            QFrame#sidebar {
-                background: #101411;
-                border: none;
-            }
-            QLabel#brandTitle {
-                color: #f5f7f4;
-                font-size: 22px;
-                font-weight: 700;
-            }
-            QLabel#brandSubtitle {
-                color: #8f9b92;
-                font-size: 12px;
-            }
-            QLabel#versionLabel {
-                color: #657169;
-                font-size: 10px;
-                font-weight: 700;
-            }
-            QListWidget#navigation {
-                background: transparent;
-                border: none;
-                outline: none;
-            }
-            QListWidget#navigation::item {
-                color: #aeb8b1;
-                min-height: 42px;
-                padding: 0 14px;
-                margin: 3px 0;
-                border-radius: 6px;
-            }
-            QListWidget#navigation::item:hover {
-                background: #1a201c;
-                color: #ffffff;
-            }
-            QListWidget#navigation::item:selected {
-                background: #21392b;
-                color: #f6fff9;
-                font-weight: 700;
-            }
-            QLabel#pageTitle {
-                font-size: 24px;
-                font-weight: 700;
-                color: #172019;
-            }
-            QFrame#statusChip {
-                border-radius: 8px;
-                border: 1px solid #d6ddd7;
-                background: #ffffff;
-            }
-            QFrame#statusChip[state="running"] {
-                background: #eaf7ef;
-                border-color: #b8dfc7;
-            }
-            QLabel#statusDot {
-                color: #a5aca7;
-                font-size: 12px;
-            }
-            QFrame#statusChip[state="running"] QLabel#statusDot {
-                color: #238553;
-            }
-            QLabel#statusText {
-                color: #48534b;
-                font-size: 12px;
-                font-weight: 700;
-            }
-            QPushButton#iconButton {
-                background: #ffffff;
-                border: 1px solid #d9dfda;
-                border-radius: 6px;
-                padding: 0;
-            }
-            QPushButton#iconButton:hover {
-                background: #e9ede9;
-            }
-            QFrame#heroPanel {
-                background: #ffffff;
-                border: 1px solid #dce2dd;
-                border-radius: 8px;
-            }
-            QLabel#eyebrow {
-                color: #238553;
-                font-size: 10px;
-                font-weight: 700;
-            }
-            QLabel#heroTitle {
-                color: #162019;
-                font-size: 22px;
-                font-weight: 700;
-            }
-            QLabel#heroDetail, QLabel#pageHint, QLabel#panelDetail {
-                color: #6b766e;
-                font-size: 12px;
-            }
-            QFrame#metricCard, QFrame#diagnosticCard {
-                background: #ffffff;
-                border: 1px solid #dce2dd;
-                border-radius: 8px;
-            }
-            QLabel#metricTitle, QLabel#diagnosticTitle, QLabel#configTitle {
-                color: #737e76;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QLabel#metricValue {
-                color: #142019;
-                font-size: 25px;
-                font-weight: 700;
-            }
-            QLabel#metricSubtitle {
-                color: #8a948d;
-                font-size: 10px;
-            }
-            QLabel#sectionTitle, QLabel#panelTitle {
-                color: #1c251e;
-                font-size: 15px;
-                font-weight: 700;
-            }
-            QFrame#configBand {
-                background: #e8ece8;
-                border: 1px solid #d7ddd8;
-                border-radius: 8px;
-            }
-            QLabel#configValue {
-                color: #202a22;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QFrame#sectionPanel {
-                background: #ffffff;
-                border: 1px solid #dce2dd;
-                border-radius: 8px;
-            }
-            QLabel#diagnosticValue {
-                color: #4e5a51;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QFrame#diagnosticCard[status="good"] {
-                background: #ecf8f0;
-                border-color: #b8dfc7;
-            }
-            QFrame#diagnosticCard[status="bad"] {
-                background: #fff0ee;
-                border-color: #ecc5c1;
-            }
-            QFrame#diagnosticCard[status="warning"] {
-                background: #fff7e8;
-                border-color: #ebd2a6;
-            }
-            QPushButton {
-                min-height: 36px;
-                padding: 0 14px;
-                border-radius: 6px;
-                font-weight: 600;
-            }
-            QPushButton[role="primary"] {
-                color: #ffffff;
-                background: #227d4f;
-                border: 1px solid #227d4f;
-            }
-            QPushButton[role="primary"]:hover {
-                background: #196840;
-            }
-            QPushButton[role="secondary"] {
-                color: #263129;
-                background: #ffffff;
-                border: 1px solid #ccd4ce;
-            }
-            QPushButton[role="secondary"]:hover {
-                background: #edf0ed;
-            }
-            QPushButton[role="danger"] {
-                color: #9b3733;
-                background: #fff7f6;
-                border: 1px solid #e7c7c4;
-            }
-            QPushButton[role="danger"]:hover {
-                background: #fde9e7;
-            }
-            QPushButton[role="link"] {
-                color: #227d4f;
-                background: transparent;
-                border: none;
-                padding: 0 4px;
-            }
-            QLineEdit, QComboBox, QSpinBox {
-                min-height: 36px;
-                background: #fbfcfb;
-                border: 1px solid #cfd7d1;
-                border-radius: 6px;
-                padding: 0 10px;
-                selection-background-color: #2e8a59;
-            }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
-                border: 1px solid #2b8b58;
-                background: #ffffff;
-            }
-            QLineEdit#hotkeyCapture {
-                color: #1d5e3b;
-                background: #f7faf8;
-                font-weight: 700;
-            }
-            QLineEdit#hotkeyCapture[capturing="true"] {
-                color: #7c520d;
-                background: #fff8e8;
-                border: 1px solid #d7a84d;
-            }
-            QLabel#hotkeyConflictStatus {
-                color: #5e6961;
-                background: #f4f6f4;
-                border: 1px solid #dce2dd;
-                border-radius: 6px;
-                padding: 7px 10px;
-                font-size: 11px;
-                font-weight: 600;
-            }
-            QLabel#hotkeyConflictStatus[state="good"] {
-                color: #1e6942;
-                background: #edf8f1;
-                border-color: #c3e2cf;
-            }
-            QLabel#hotkeyConflictStatus[state="bad"] {
-                color: #9b3733;
-                background: #fff3f1;
-                border-color: #e7c7c4;
-            }
-            QLabel#hotkeyConflictStatus[state="capture"] {
-                color: #7c520d;
-                background: #fff8e8;
-                border-color: #e5cc94;
-            }
-            QLabel#shortcutSummary {
-                color: #1d5e3b;
-                background: #edf7f0;
-                border: 1px solid #cce3d4;
-                border-radius: 6px;
-                padding: 7px 10px;
-                font-size: 12px;
-                font-weight: 700;
-            }
-            QToolButton#spinStepButton {
-                background: #ffffff;
-                border: 1px solid #c6d0c8;
-                border-radius: 6px;
-                padding: 5px;
-            }
-            QToolButton#spinStepButton:hover {
-                background: #e8f2eb;
-                border-color: #72a987;
-            }
-            QToolButton#spinStepButton:pressed {
-                background: #d9eadf;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 26px;
-            }
-            QCheckBox {
-                spacing: 8px;
-                color: #354038;
-            }
-            QTableWidget#dataTable {
-                background: #ffffff;
-                alternate-background-color: #ffffff;
-                border: 1px solid #dce2dd;
-                border-radius: 8px;
-                outline: none;
-                selection-background-color: #e5f3ea;
-                selection-color: #152019;
-            }
-            QTableWidget#dataTable::item {
-                border-bottom: 1px solid #edf0ed;
-                padding: 0 8px;
-            }
-            QHeaderView::section {
-                min-height: 34px;
-                color: #667169;
-                background: #eef1ee;
-                border: none;
-                border-bottom: 1px solid #d9dfda;
-                padding: 0 8px;
-                font-size: 11px;
-                font-weight: 700;
-            }
-            QLabel#logPath {
-                color: #7c867f;
-                font-size: 11px;
-            }
-            QLabel#glossaryArrow {
-                color: #238553;
-                font-size: 20px;
-                font-weight: 700;
-                min-width: 24px;
-            }
-            QLabel#glossaryStatus {
-                color: #728078;
-                font-size: 11px;
-            }
-            QLabel#glossaryPreview {
-                color: #1d5e3b;
-                background: #edf7f0;
-                border: 1px solid #cce3d4;
-                border-radius: 6px;
-                padding: 10px 12px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-            QLabel#personaPreview {
-                color: #23476b;
-                background: #eef5fb;
-                border: 1px solid #c7d9e8;
-                border-radius: 6px;
-                padding: 10px 12px;
-                font-size: 13px;
-                font-weight: 600;
-                min-height: 36px;
-            }
-            QPlainTextEdit#compactTextEdit {
-                color: #172019;
-                background: #fbfcfb;
-                border: 1px solid #cfd7d1;
-                border-radius: 6px;
-                padding: 7px 9px;
-                selection-background-color: #2e8a59;
-            }
-            QPlainTextEdit#compactTextEdit:focus {
-                border: 1px solid #2b8b58;
-                background: #ffffff;
-            }
-            QPlainTextEdit#logView {
-                color: #dce8df;
-                background: #151a16;
-                border: 1px solid #2b332d;
-                border-radius: 8px;
-                padding: 12px;
-                font-family: "Ubuntu Mono";
-                font-size: 12px;
-            }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 10px;
-                margin: 2px;
-            }
-            QScrollBar::handle:vertical {
-                background: #bec7c0;
-                border-radius: 4px;
-                min-height: 28px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
-            }
-            """
-        )
+        self.setStyleSheet(build_stylesheet(self._ui_theme))
+        # Dynamic properties (statusChip state, etc.) need a polish pass.
+        for widget in self.findChildren(QWidget):
+            style = widget.style()
+            style.unpolish(widget)
+            style.polish(widget)
+        self.update()
+
+    def _save_ui_theme(self, *_args: object) -> None:
+        theme_id = normalize_theme(self.theme_combo.currentData())
+        if theme_id == self._ui_theme:
+            return
+        try:
+            self.env_store.update({"UI_THEME": theme_id})
+        except Exception as exc:  # noqa: BLE001
+            set_combo_data(self.theme_combo, self._ui_theme)
+            QMessageBox.critical(self, "界面主题保存失败", f"写入配置失败：{exc}")
+            return
+        self._ui_theme = theme_id
+        self._apply_styles()
+        # Theme is UI-only; no service restart and no hotkey changes.
 
     def change_page(self, index: int) -> None:
         if index < 0:
@@ -2839,6 +2533,14 @@ class ControlUI(QMainWindow):
 
     def load_settings(self) -> None:
         env = self.env_store.read()
+        theme_id = normalize_theme(env.get("UI_THEME", DEFAULT_THEME))
+        if hasattr(self, "theme_combo"):
+            self.theme_combo.blockSignals(True)
+            set_combo_data(self.theme_combo, theme_id)
+            self.theme_combo.blockSignals(False)
+        if theme_id != self._ui_theme:
+            self._ui_theme = theme_id
+            self._apply_styles()
         retention_days = self.env_store.get_int(
             env,
             "HISTORY_RETENTION_DAYS",

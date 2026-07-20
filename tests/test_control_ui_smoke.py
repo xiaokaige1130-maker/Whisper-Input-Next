@@ -102,6 +102,28 @@ class ControlUISmokeTests(unittest.TestCase):
                 "cmd_r+e",
             )
             self.assertEqual(window.agent_hotkey_input.hotkey(), "alt_r+a")
+            # Linux hotkey defaults must stay (different from macOS).
+            self.assertEqual(
+                window.smart_input_hotkey_input.hotkey(),
+                "cmd_r",
+            )
+            self.assertEqual(window.theme_combo.currentData(), "classic")
+            self.assertEqual(window._ui_theme, "classic")
+            self.assertIn("#101411", window.styleSheet())
+            theme_index = window.theme_combo.findData("dark")
+            self.assertGreaterEqual(theme_index, 0)
+            window.theme_combo.setCurrentIndex(theme_index)
+            window._save_ui_theme()
+            self.assertEqual(window._ui_theme, "dark")
+            self.assertIn("#1c1c1e", window.styleSheet())
+            saved_env = (root / ".env").read_text(encoding="utf-8")
+            self.assertIn("UI_THEME=dark", saved_env)
+            # Restore classic for remaining assertions.
+            classic_index = window.theme_combo.findData("classic")
+            window.theme_combo.setCurrentIndex(classic_index)
+            window._save_ui_theme()
+            self.assertLessEqual(window.minimumWidth(), 1000)
+            self.assertLessEqual(window.width(), 1100)
             self.assertEqual(
                 window.translation_shortcut_summary.text(),
                 "右 Ctrl · 按住说话",

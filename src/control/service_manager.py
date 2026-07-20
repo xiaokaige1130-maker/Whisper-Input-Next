@@ -39,10 +39,14 @@ class ServiceManager:
         )
 
     def is_running(self) -> bool:
-        result = self.run(
-            ["tmux", "has-session", "-t", self.session_name],
-            timeout=5,
-        )
+        try:
+            result = self.run(
+                ["tmux", "has-session", "-t", self.session_name],
+                timeout=5,
+            )
+        except FileNotFoundError:
+            # tmux missing (dev machine / partial install) → treat as stopped.
+            return False
         return result.returncode == 0
 
     def start(self) -> tuple[bool, str]:
